@@ -632,7 +632,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[stri
 		http.Error(w, "failed to connect to target", http.StatusBadGateway)
 		return
 	}
-	defer dstConn.Close()
+	defer dstConn.Close() //nolint:errcheck
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -645,7 +645,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[stri
 		http.Error(w, "failed to hijack client connection", http.StatusInternalServerError)
 		return
 	}
-	defer clientConn.Close()
+	defer clientConn.Close() //nolint:errcheck
 
 	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		slog.Warn("CONNECT write 200 failed", "target", target, "err", err)
@@ -718,7 +718,7 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	removeHopByHopHeaders(resp.Header)
 

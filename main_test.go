@@ -404,7 +404,7 @@ func TestSafeDial_BlocksPrivateLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer ln.Close() //nolint:errcheck
 
 	_, err = safeDial(context.Background(), "tcp", ln.Addr().String(), 2*time.Second)
 	if !errors.Is(err, errBlockedAddress) {
@@ -491,7 +491,7 @@ func TestHandleConnect_DrainsBufferedClientBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen dst: %v", err)
 	}
-	defer dstLn.Close()
+	defer dstLn.Close() //nolint:errcheck
 
 	received := make(chan []byte, 1)
 	go func() {
@@ -499,7 +499,7 @@ func TestHandleConnect_DrainsBufferedClientBytes(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer c.Close()
+		defer c.Close() //nolint:errcheck
 		buf := make([]byte, 64)
 		n, _ := c.Read(buf)
 		received <- buf[:n]
@@ -515,14 +515,14 @@ func TestHandleConnect_DrainsBufferedClientBytes(t *testing.T) {
 			t.Errorf("dial dst: %v", err)
 			return
 		}
-		defer dst.Close()
+		defer dst.Close() //nolint:errcheck
 		hj, _ := w.(http.Hijacker)
 		cc, buf, err := hj.Hijack()
 		if err != nil {
 			t.Errorf("hijack: %v", err)
 			return
 		}
-		defer cc.Close()
+		defer cc.Close() //nolint:errcheck
 		_, _ = buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 		_ = buf.Flush()
 		if n := buf.Reader.Buffered(); n > 0 {
@@ -538,10 +538,10 @@ func TestHandleConnect_DrainsBufferedClientBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
 	}
-	defer proxyLn.Close()
+	defer proxyLn.Close() //nolint:errcheck
 	srv := &http.Server{Handler: mux}
-	go srv.Serve(proxyLn)
-	defer srv.Close()
+	go func() { _ = srv.Serve(proxyLn) }()
+	defer srv.Close() //nolint:errcheck
 
 	// Pipeline CONNECT + payload in a single TCP write so the payload
 	// is parked in the server-side bufio.Reader before Hijack returns.
@@ -549,7 +549,7 @@ func TestHandleConnect_DrainsBufferedClientBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck
 
 	pipelined := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\nHELLO-PIPELINED"
 	if _, err := conn.Write([]byte(pipelined)); err != nil {
@@ -715,7 +715,7 @@ func TestHandleConnect_WaitsForBothDirections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen dst: %v", err)
 	}
-	defer dstLn.Close()
+	defer dstLn.Close() //nolint:errcheck
 
 	const payload = "FROM-DESTINATION"
 
@@ -724,7 +724,7 @@ func TestHandleConnect_WaitsForBothDirections(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer c.Close()
+		defer c.Close() //nolint:errcheck
 		// Read any pipelined bytes from the client, then send the payload.
 		_, _ = io.Copy(io.Discard, &readUntilEOF{c})
 		_, _ = c.Write([]byte(payload))
@@ -739,7 +739,7 @@ func TestHandleConnect_WaitsForBothDirections(t *testing.T) {
 			t.Errorf("dial dst: %v", err)
 			return
 		}
-		defer dst.Close()
+		defer dst.Close() //nolint:errcheck
 
 		hj, _ := w.(http.Hijacker)
 		cc, buf, err := hj.Hijack()
@@ -747,7 +747,7 @@ func TestHandleConnect_WaitsForBothDirections(t *testing.T) {
 			t.Errorf("hijack: %v", err)
 			return
 		}
-		defer cc.Close()
+		defer cc.Close() //nolint:errcheck
 		_, _ = buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 		_ = buf.Flush()
 
@@ -762,16 +762,16 @@ func TestHandleConnect_WaitsForBothDirections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen proxy: %v", err)
 	}
-	defer proxyLn.Close()
+	defer proxyLn.Close() //nolint:errcheck
 	srv := &http.Server{Handler: handler}
-	go srv.Serve(proxyLn)
-	defer srv.Close()
+	go func() { _ = srv.Serve(proxyLn) }()
+	defer srv.Close() //nolint:errcheck
 
 	conn, err := net.Dial("tcp", proxyLn.Addr().String())
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck
 
 	if _, err := conn.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")); err != nil {
 		t.Fatalf("write connect: %v", err)
