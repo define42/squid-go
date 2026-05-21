@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -264,36 +265,66 @@ func TestConfiguredListenAddr(t *testing.T) {
 	})
 }
 
-func TestConfiguredACMEDomain(t *testing.T) {
-	t.Run("returns empty string when env is empty", func(t *testing.T) {
+func TestConfiguredACMEDomains(t *testing.T) {
+	t.Run("returns nil when env is empty", func(t *testing.T) {
 		t.Setenv(acmeDomainEnv, "")
-		if got := configuredACMEDomain(); got != "" {
-			t.Fatalf("configuredACMEDomain() = %q, want %q", got, "")
+		if got := configuredACMEDomains(); got != nil {
+			t.Fatalf("configuredACMEDomains() = %v, want nil", got)
 		}
 	})
 
 	t.Run("uses domain from env", func(t *testing.T) {
-		want := "proxy.internal.example"
-		t.Setenv(acmeDomainEnv, want)
-		if got := configuredACMEDomain(); got != want {
-			t.Fatalf("configuredACMEDomain() = %q, want %q", got, want)
+		want := []string{"proxy.internal.example"}
+		t.Setenv(acmeDomainEnv, want[0])
+		got := configuredACMEDomains()
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("configuredACMEDomains() = %v, want %v", got, want)
 		}
 	})
 
 	t.Run("supports ipv4", func(t *testing.T) {
-		want := "203.0.113.8"
-		t.Setenv(acmeDomainEnv, want)
-		if got := configuredACMEDomain(); got != want {
-			t.Fatalf("configuredACMEDomain() = %q, want %q", got, want)
+		want := []string{"203.0.113.8"}
+		t.Setenv(acmeDomainEnv, want[0])
+		got := configuredACMEDomains()
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("configuredACMEDomains() = %v, want %v", got, want)
 		}
 	})
 
 	t.Run("supports bracketed ipv6", func(t *testing.T) {
 		raw := "[2001:db8::1]"
-		want := net.ParseIP("2001:db8::1").String()
+		want := []string{"2001:db8::1"}
 		t.Setenv(acmeDomainEnv, raw)
-		if got := configuredACMEDomain(); got != want {
-			t.Fatalf("configuredACMEDomain() = %q, want %q", got, want)
+		got := configuredACMEDomains()
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("configuredACMEDomains() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("splits comma-separated list", func(t *testing.T) {
+		t.Setenv(acmeDomainEnv, "proxy.example.com, www.proxy.example.com ,[2001:db8::1]")
+		want := []string{"proxy.example.com", "www.proxy.example.com", "2001:db8::1"}
+		got := configuredACMEDomains()
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("configuredACMEDomains() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ignores empty entries", func(t *testing.T) {
+		t.Setenv(acmeDomainEnv, ",,proxy.example.com,,")
+		want := []string{"proxy.example.com"}
+		got := configuredACMEDomains()
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("configuredACMEDomains() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("deduplicates entries", func(t *testing.T) {
+		t.Setenv(acmeDomainEnv, "proxy.example.com,proxy.example.com,www.proxy.example.com")
+		want := []string{"proxy.example.com", "www.proxy.example.com"}
+		got := configuredACMEDomains()
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("configuredACMEDomains() = %v, want %v", got, want)
 		}
 	})
 }
@@ -799,4 +830,69 @@ func TestListenerHostPort(t *testing.T) {
 			}
 		})
 	}
+}
+
+// FuzzAuthorized exercises the proxy authentication header parser with
+// arbitrary input. It must not panic and must not return true for any
+// non-empty allow-list configuration when fed random `Proxy-Authorization`
+// header values, since the fuzzer cannot guess the correct sha256 digest
+// of a valid credential pair.
+func FuzzAuthorized(f *testing.F) {
+// Seed with a mix of malformed, empty, and structurally-valid headers
+// so the fuzzer has something interesting to mutate from.
+seeds := []string{
+"",
+"Basic ",
+"Basic !!!not-base64!!!",
+"Bearer " + base64.StdEncoding.EncodeToString([]byte("user:pass")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte("")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte(":")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte("user:")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte(":pass")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass:extra")),
+"Basic " + base64.StdEncoding.EncodeToString([]byte("\x00\x01\x02:\xff\xfe")),
+"Basic " + strings.Repeat("A", 1024),
+}
+for _, s := range seeds {
+f.Add(s)
+}
+
+// Configure an allow-list with two known-good digests. Any random
+// header that fails to decode to exactly one of these must be rejected.
+hashWant1 := sha256Hex(testProxyUser, testProxyPass)
+hashWant2 := sha256Hex(testProxyUser2, testProxyPass2)
+f.Setenv(proxyAuthEnv, hashWant1+proxyAuthDelimiter+hashWant2)
+
+f.Fuzz(func(t *testing.T, header string) {
+req := httptest.NewRequest(http.MethodGet, "http://example.invalid/", nil)
+if header != "" {
+req.Header.Set("Proxy-Authorization", header)
+}
+
+// Must not panic regardless of input.
+got := authorized(req)
+if !got {
+return
+}
+
+// If authorized returned true, the fuzzer must have stumbled onto
+// a credential pair whose sha256 matches an allow-list entry.
+// That's only possible when the header decodes to one of the
+// two seed credentials. Confirm by recomputing the digest.
+const prefix = "Basic "
+if !strings.HasPrefix(header, prefix) {
+t.Fatalf("authorized returned true for header without %q prefix: %q", prefix, header)
+}
+raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(header, prefix))
+if err != nil {
+t.Fatalf("authorized returned true for header with invalid base64: %q", header)
+}
+sum := sha256.Sum256(raw)
+gotHash := hex.EncodeToString(sum[:])
+if gotHash != hashWant1 && gotHash != hashWant2 {
+t.Fatalf("authorized returned true for header whose digest %q is not in the allow-list", gotHash)
+}
+})
 }

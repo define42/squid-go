@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -40,6 +40,12 @@ const (
 	// required when running in ACME mode (i.e. when ACME_DOMAIN is set)
 	// so account recovery and expiration notices reach a real mailbox.
 	acmeEmailEnv  = "ACME_EMAIL"
+	// acmeDomainEnv is a comma-separated list of DNS names or IP addresses
+	// that the ACME certificate should cover (e.g.
+	// "proxy.example.com,www.proxy.example.com"). All listed names must
+	// resolve to this host so the TLS-ALPN-01 challenge succeeds for each
+	// one. Bracketed IPv6 literals (e.g. "[2001:db8::1]") are unwrapped
+	// per entry.
 	acmeDomainEnv = "ACME_DOMAIN"
 
 	// listenAddrEnv overrides the TCP address the proxy listens on.
@@ -205,12 +211,13 @@ var isBlockedIP = func(ip net.IP) bool {
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		slog.Error("server exited with error", "err", err)
+		os.Exit(1)
 	}
 }
 
 func run() error {
-	acmeDomain := configuredACMEDomain()
+	acmeDomains := configuredACMEDomains()
 	listenAddr := configuredListenAddr()
 
 	allowedPorts, err := configuredConnectPorts()
@@ -220,8 +227,8 @@ func run() error {
 
 	var tlsConfig *tls.Config
 
-	if acmeDomain == "" {
-		log.Printf("ACME_DOMAIN not set; using auto-generated self-signed certificate")
+	if len(acmeDomains) == 0 {
+		slog.Info("ACME_DOMAIN not set; using auto-generated self-signed certificate")
 
 		cfg, err := selfSignedTLSConfig()
 		if err != nil {
@@ -234,13 +241,16 @@ func run() error {
 			return fmt.Errorf("invalid ACME configuration: %w", err)
 		}
 
-		cfg, err := managedTLSConfig(acmeDomain, acmeEmail)
+		cfg, err := managedTLSConfig(acmeDomains, acmeEmail)
 		if err != nil {
-			return fmt.Errorf("failed to manage certificate for %s: %w", acmeDomain, err)
+			return fmt.Errorf("failed to manage certificate for %s: %w", strings.Join(acmeDomains, ","), err)
 		}
 		tlsConfig = cfg
 
-		log.Printf("HTTPS proxy listening on https://%s", listenerHostPort(acmeDomain, listenAddr))
+		slog.Info("HTTPS proxy listening",
+			"url", "https://"+listenerHostPort(acmeDomains[0], listenAddr),
+			"domains", acmeDomains,
+		)
 	}
 
 	handler := newProxyHandler(allowedPorts)
@@ -271,11 +281,11 @@ func run() error {
 
 	select {
 	case <-ctx.Done():
-		log.Printf("shutdown signal received; draining connections")
+		slog.Info("shutdown signal received; draining connections")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("graceful shutdown failed: %v", err)
+			slog.Error("graceful shutdown failed", "err", err)
 		}
 		// Wait for the serve goroutine to finish so we don't return while
 		// it may still be writing to the server's TLS listener.
@@ -286,12 +296,36 @@ func run() error {
 	}
 }
 
-func configuredACMEDomain() string {
-	domain := strings.TrimSpace(os.Getenv(acmeDomainEnv))
-	if domain == "" {
-		return ""
+// configuredACMEDomains returns the list of DNS names or IP addresses
+// the ACME certificate should cover. The ACME_DOMAIN environment
+// variable holds a comma-separated list (e.g.
+// "proxy.example.com,www.proxy.example.com"). Whitespace and empty
+// entries are ignored, and bracketed IPv6 literals are unwrapped per
+// entry. Returns nil when the variable is unset or contains only empty
+// values, which selects self-signed mode.
+func configuredACMEDomains() []string {
+	raw := strings.TrimSpace(os.Getenv(acmeDomainEnv))
+	if raw == "" {
+		return nil
 	}
-	return strings.Trim(domain, "[]")
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, p := range parts {
+		p = strings.Trim(strings.TrimSpace(p), "[]")
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // configuredListenAddr returns the TCP address the proxy should bind to.
@@ -390,7 +424,10 @@ func configuredACMEEmail() (string, error) {
 	return email, nil
 }
 
-func managedTLSConfig(acmeDomain, acmeEmail string) (*tls.Config, error) {
+func managedTLSConfig(acmeDomains []string, acmeEmail string) (*tls.Config, error) {
+	if len(acmeDomains) == 0 {
+		return nil, fmt.Errorf("no ACME domains configured")
+	}
 	storagePath, err := configuredCertStoragePath()
 	if err != nil {
 		return nil, err
@@ -409,7 +446,7 @@ func managedTLSConfig(acmeDomain, acmeEmail string) (*tls.Config, error) {
 
 	magic := certmagic.NewDefault()
 
-	if err := magic.ManageSync(context.Background(), []string{acmeDomain}); err != nil {
+	if err := magic.ManageSync(context.Background(), acmeDomains); err != nil {
 		return nil, err
 	}
 
@@ -588,7 +625,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[stri
 	dstConn, err := safeDial(r.Context(), "tcp", net.JoinHostPort(host, port), 10*time.Second)
 	if err != nil {
 		if errors.Is(err, errBlockedAddress) {
-			log.Printf("CONNECT %s blocked: %v", target, err)
+			slog.Warn("CONNECT blocked", "target", target, "err", err)
 			http.Error(w, "target address is not allowed", http.StatusForbidden)
 			return
 		}
@@ -611,11 +648,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[stri
 	defer clientConn.Close()
 
 	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		log.Printf("CONNECT %s: write 200: %v", target, err)
+		slog.Warn("CONNECT write 200 failed", "target", target, "err", err)
 		return
 	}
 	if err := buffered.Flush(); err != nil {
-		log.Printf("CONNECT %s: flush 200: %v", target, err)
+		slog.Warn("CONNECT flush 200 failed", "target", target, "err", err)
 		return
 	}
 
@@ -625,12 +662,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[stri
 	// connection, otherwise they would be silently dropped.
 	if n := buffered.Reader.Buffered(); n > 0 {
 		if _, err := io.CopyN(dstConn, buffered.Reader, int64(n)); err != nil {
-			log.Printf("CONNECT %s: drain buffered client bytes: %v", target, err)
+			slog.Warn("CONNECT drain buffered client bytes failed", "target", target, "err", err)
 			return
 		}
 	}
 
-	log.Printf("CONNECT %s", target)
+	slog.Info("CONNECT", "target", target)
 
 	// Splice both directions and wait for BOTH to finish before returning.
 	// The first goroutine to exit calls SetDeadline on both ends so that
@@ -674,7 +711,7 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := httpProxyTransport.RoundTrip(outReq)
 	if err != nil {
 		if errors.Is(err, errBlockedAddress) {
-			log.Printf("%s %s blocked: %v", r.Method, r.URL.String(), err)
+			slog.Warn("HTTP request blocked", "method", r.Method, "url", r.URL.String(), "err", err)
 			http.Error(w, "target address is not allowed", http.StatusForbidden)
 			return
 		}
@@ -689,11 +726,11 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("%s %s -> %d: response body copy: %v", r.Method, r.URL.String(), resp.StatusCode, err)
+		slog.Warn("response body copy failed", "method", r.Method, "url", r.URL.String(), "status", resp.StatusCode, "err", err)
 		return
 	}
 
-	log.Printf("%s %s -> %d", r.Method, r.URL.String(), resp.StatusCode)
+	slog.Info("HTTP proxy request", "method", r.Method, "url", r.URL.String(), "status", resp.StatusCode)
 }
 
 // proxyCopy splices data from src to dst. When src reports EOF, it
