@@ -28,8 +28,9 @@ const (
 	proxyAuthEnv       = "PROXY_AUTH_SHA256"
 	proxyAuthDelimiter = ","
 
-	acmeEmail  = "admin@example.com"
-	acmeDomain = "proxy.example.com"
+	acmeEmail         = "admin@example.com"
+	acmeDomainEnv     = "ACME_DOMAIN"
+	defaultACMEDomain = "proxy.example.com"
 
 	certStoragePath = "./certmagic-storage"
 )
@@ -50,6 +51,8 @@ var httpProxyTransport = &http.Transport{
 }
 
 func main() {
+	acmeDomain := configuredACMEDomain()
+
 	if err := os.MkdirAll(certStoragePath, 0700); err != nil {
 		log.Fatalf("could not create CertMagic storage directory: %v", err)
 	}
@@ -93,11 +96,27 @@ func main() {
 		TLSConfig:         tlsConfig,
 	}
 
-	log.Printf("HTTPS proxy listening on https://%s%s", acmeDomain, proxyListen)
+	log.Printf("HTTPS proxy listening on https://%s", listenerHostPort(acmeDomain, proxyListen))
 
 	if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func configuredACMEDomain() string {
+	domain := strings.TrimSpace(os.Getenv(acmeDomainEnv))
+	if domain == "" {
+		return defaultACMEDomain
+	}
+	return strings.Trim(domain, "[]")
+}
+
+func listenerHostPort(host, addr string) string {
+	port := strings.TrimPrefix(addr, ":")
+	if port == "" {
+		return host
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {

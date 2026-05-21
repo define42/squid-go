@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -224,5 +225,61 @@ func TestRemoveHopByHopHeaders(t *testing.T) {
 	}
 	if got := h.Get("X-Keep"); got != "keep-me" {
 		t.Errorf("X-Keep = %q, want %q", got, "keep-me")
+	}
+}
+
+func TestConfiguredACMEDomain(t *testing.T) {
+	t.Run("uses default when env is empty", func(t *testing.T) {
+		t.Setenv(acmeDomainEnv, "")
+		if got := configuredACMEDomain(); got != defaultACMEDomain {
+			t.Fatalf("configuredACMEDomain() = %q, want %q", got, defaultACMEDomain)
+		}
+	})
+
+	t.Run("uses domain from env", func(t *testing.T) {
+		want := "proxy.internal.example"
+		t.Setenv(acmeDomainEnv, want)
+		if got := configuredACMEDomain(); got != want {
+			t.Fatalf("configuredACMEDomain() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("supports ipv4", func(t *testing.T) {
+		want := "203.0.113.8"
+		t.Setenv(acmeDomainEnv, want)
+		if got := configuredACMEDomain(); got != want {
+			t.Fatalf("configuredACMEDomain() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("supports bracketed ipv6", func(t *testing.T) {
+		raw := "[2001:db8::1]"
+		want := net.ParseIP("2001:db8::1").String()
+		t.Setenv(acmeDomainEnv, raw)
+		if got := configuredACMEDomain(); got != want {
+			t.Fatalf("configuredACMEDomain() = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestListenerHostPort(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		addr string
+		want string
+	}{
+		{name: "domain host", host: "proxy.example.com", addr: ":443", want: "proxy.example.com:443"},
+		{name: "ipv4 host", host: "203.0.113.8", addr: ":443", want: "203.0.113.8:443"},
+		{name: "ipv6 host", host: "2001:db8::1", addr: ":443", want: "[2001:db8::1]:443"},
+		{name: "missing port", host: "proxy.example.com", addr: "", want: "proxy.example.com"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := listenerHostPort(tc.host, tc.addr); got != tc.want {
+				t.Fatalf("listenerHostPort(%q, %q) = %q, want %q", tc.host, tc.addr, got, tc.want)
+			}
+		})
 	}
 }
