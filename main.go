@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log"
@@ -21,8 +23,10 @@ const (
 	// You may run directly on :443, or port-forward external 443 to this process.
 	proxyListen = ":443"
 
-	proxyUser = "user"
-	proxyPass = "pass"
+	// proxyAuthEnv is the environment variable that holds one or more
+	// sha256(user:password) hex digests, separated by proxyAuthDelimiter.
+	proxyAuthEnv       = "PROXY_AUTH_SHA256"
+	proxyAuthDelimiter = ","
 
 	acmeEmail  = "admin@example.com"
 	acmeDomain = "proxy.example.com"
@@ -127,9 +131,53 @@ func authorized(r *http.Request) bool {
 		return false
 	}
 
-	expected := proxyUser + ":" + proxyPass
+	// Require a non-empty "user:password" pair.
+	colon := strings.IndexByte(string(raw), ':')
+	if colon <= 0 || colon == len(raw)-1 {
+		return false
+	}
 
-	return subtle.ConstantTimeCompare(raw, []byte(expected)) == 1
+	sum := sha256.Sum256(raw)
+	got := make([]byte, hex.EncodedLen(len(sum)))
+	hex.Encode(got, sum[:])
+
+	allowed := allowedAuthHashes()
+	if len(allowed) == 0 {
+		return false
+	}
+
+	match := 0
+	for _, want := range allowed {
+		if len(want) != len(got) {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(want), got) == 1 {
+			match = 1
+		}
+	}
+	return match == 1
+}
+
+// allowedAuthHashes returns the configured sha256(user:password) hex digests
+// from the proxyAuthEnv environment variable. Multiple values may be provided,
+// separated by proxyAuthDelimiter. Empty entries and surrounding whitespace
+// are ignored, and hex digests are lower-cased for comparison.
+func allowedAuthHashes() []string {
+	raw := os.Getenv(proxyAuthEnv)
+	if raw == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, proxyAuthDelimiter)
+	hashes := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		hashes = append(hashes, p)
+	}
+	return hashes
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request) {

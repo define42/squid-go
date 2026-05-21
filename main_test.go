@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,11 +11,35 @@ import (
 	"testing"
 )
 
+const (
+	testProxyUser = "user"
+	testProxyPass = "pass"
+
+	// Second credential used to verify multi-value configuration.
+	testProxyUser2 = "alice"
+	testProxyPass2 = "s3cret"
+)
+
+func sha256Hex(user, pass string) string {
+	sum := sha256.Sum256([]byte(user + ":" + pass))
+	return hex.EncodeToString(sum[:])
+}
+
+func setAuthEnv(t *testing.T, hashes ...string) {
+	t.Helper()
+	t.Setenv(proxyAuthEnv, strings.Join(hashes, proxyAuthDelimiter))
+}
+
 func basicAuthHeader(user, pass string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
 }
 
 func TestAuthorized(t *testing.T) {
+	setAuthEnv(t,
+		sha256Hex(testProxyUser, testProxyPass),
+		sha256Hex(testProxyUser2, testProxyPass2),
+	)
+
 	tests := []struct {
 		name   string
 		header string
@@ -23,8 +49,10 @@ func TestAuthorized(t *testing.T) {
 		{"non-basic scheme", "Bearer token", false},
 		{"malformed base64", "Basic !!!notbase64!!!", false},
 		{"wrong credentials", basicAuthHeader("wrong", "creds"), false},
-		{"valid credentials", basicAuthHeader(proxyUser, proxyPass), true},
+		{"valid credentials", basicAuthHeader(testProxyUser, testProxyPass), true},
+		{"second valid credentials", basicAuthHeader(testProxyUser2, testProxyPass2), true},
 		{"empty credentials", basicAuthHeader("", ""), false},
+		{"missing colon", "Basic " + base64.StdEncoding.EncodeToString([]byte("nocolon")), false},
 	}
 
 	for _, tc := range tests {
@@ -40,7 +68,30 @@ func TestAuthorized(t *testing.T) {
 	}
 }
 
+func TestAuthorized_NoConfiguredHashes(t *testing.T) {
+	t.Setenv(proxyAuthEnv, "")
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.Header.Set("Proxy-Authorization", basicAuthHeader(testProxyUser, testProxyPass))
+
+	if authorized(req) {
+		t.Fatal("authorized() = true when no hashes are configured, want false")
+	}
+}
+
+func TestAllowedAuthHashes_TrimsAndLowercases(t *testing.T) {
+	h1 := sha256Hex(testProxyUser, testProxyPass)
+	t.Setenv(proxyAuthEnv, "  "+strings.ToUpper(h1)+" "+proxyAuthDelimiter+proxyAuthDelimiter+" ")
+
+	got := allowedAuthHashes()
+	if len(got) != 1 || got[0] != h1 {
+		t.Fatalf("allowedAuthHashes() = %v, want [%s]", got, h1)
+	}
+}
+
 func TestProxyHandler_Unauthorized(t *testing.T) {
+	setAuthEnv(t, sha256Hex(testProxyUser, testProxyPass))
+
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
 	rec := httptest.NewRecorder()
 
@@ -93,7 +144,7 @@ func TestHandlePlainHTTP_ForwardsRequest(t *testing.T) {
 	defer upstream.Close()
 
 	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/path", nil)
-	req.Header.Set("Proxy-Authorization", basicAuthHeader(proxyUser, proxyPass))
+	req.Header.Set("Proxy-Authorization", basicAuthHeader(testProxyUser, testProxyPass))
 	req.Header.Set("Connection", "keep-alive")
 	rec := httptest.NewRecorder()
 
