@@ -2,13 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -28,9 +35,8 @@ const (
 	proxyAuthEnv       = "PROXY_AUTH_SHA256"
 	proxyAuthDelimiter = ","
 
-	acmeEmail         = "admin@example.com"
-	acmeDomainEnv     = "ACME_DOMAIN"
-	defaultACMEDomain = "proxy.example.com"
+	acmeEmail     = "admin@example.com"
+	acmeDomainEnv = "ACME_DOMAIN"
 
 	certStoragePath = "./certmagic-storage"
 )
@@ -53,40 +59,57 @@ var httpProxyTransport = &http.Transport{
 func main() {
 	acmeDomain := configuredACMEDomain()
 
-	if err := os.MkdirAll(certStoragePath, 0700); err != nil {
-		log.Fatalf("could not create CertMagic storage directory: %v", err)
-	}
+	var tlsConfig *tls.Config
 
-	certmagic.Default.Storage = &certmagic.FileStorage{
-		Path: certStoragePath,
-	}
+	if acmeDomain == "" {
+		log.Printf("ACME_DOMAIN not set; using auto-generated self-signed certificate")
 
-	certmagic.DefaultACME.Email = acmeEmail
-	certmagic.DefaultACME.Agreed = true
+		cfg, err := selfSignedTLSConfig()
+		if err != nil {
+			log.Fatalf("failed to generate self-signed certificate: %v", err)
+		}
 
-	// Let’s Encrypt production CA.
-	certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
+		tlsConfig = cfg
+	} else {
+		if err := os.MkdirAll(certStoragePath, 0700); err != nil {
+			log.Fatalf("could not create CertMagic storage directory: %v", err)
+		}
 
-	// No DNS01Solver.
-	// No HTTP-01 listener.
-	// TLS-ALPN-01 is handled through the TLS listener on :443.
-	magic := certmagic.NewDefault()
+		certmagic.Default.Storage = &certmagic.FileStorage{
+			Path: certStoragePath,
+		}
 
-	// Start certificate management.
-	// CertMagic will obtain/renew certs automatically.
-	if err := magic.ManageSync(context.Background(), []string{acmeDomain}); err != nil {
-		log.Fatalf("failed to manage certificate for %s: %v", acmeDomain, err)
-	}
+		certmagic.DefaultACME.Email = acmeEmail
+		certmagic.DefaultACME.Agreed = true
 
-	tlsConfig := magic.TLSConfig()
+		// Let's Encrypt production CA.
+		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
 
-	// Important for a traditional HTTP proxy:
-	// keep HTTP/1.1 enabled because CONNECT tunneling uses Hijacker here.
-	//
-	// Keep acme-tls/1 so TLS-ALPN-01 can work.
-	tlsConfig.NextProtos = []string{
-		"http/1.1",
-		"acme-tls/1",
+		// No DNS01Solver.
+		// No HTTP-01 listener.
+		// TLS-ALPN-01 is handled through the TLS listener on :443.
+		magic := certmagic.NewDefault()
+
+		// Start certificate management.
+		// CertMagic will obtain/renew certs automatically.
+		if err := magic.ManageSync(context.Background(), []string{acmeDomain}); err != nil {
+			log.Fatalf("failed to manage certificate for %s: %v", acmeDomain, err)
+		}
+
+		cfg := magic.TLSConfig()
+
+		// Important for a traditional HTTP proxy:
+		// keep HTTP/1.1 enabled because CONNECT tunneling uses Hijacker here.
+		//
+		// Keep acme-tls/1 so TLS-ALPN-01 can work.
+		cfg.NextProtos = []string{
+			"http/1.1",
+			"acme-tls/1",
+		}
+
+		tlsConfig = cfg
+
+		log.Printf("HTTPS proxy listening on https://%s", listenerHostPort(acmeDomain, proxyListen))
 	}
 
 	server := &http.Server{
@@ -96,8 +119,6 @@ func main() {
 		TLSConfig:         tlsConfig,
 	}
 
-	log.Printf("HTTPS proxy listening on https://%s", listenerHostPort(acmeDomain, proxyListen))
-
 	if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -106,9 +127,49 @@ func main() {
 func configuredACMEDomain() string {
 	domain := strings.TrimSpace(os.Getenv(acmeDomainEnv))
 	if domain == "" {
-		return defaultACMEDomain
+		return ""
 	}
 	return strings.Trim(domain, "[]")
+}
+
+// selfSignedTLSConfig generates an ephemeral ECDSA P-256 key and a
+// self-signed certificate valid for 10 years. Use this when no ACME_DOMAIN
+// is configured and domain-based certificate management is not needed.
+func selfSignedTLSConfig() (*tls.Config, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "squid-go"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return nil, err
+	}
+
+	cert := tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  key,
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	}, nil
 }
 
 func listenerHostPort(host, addr string) string {

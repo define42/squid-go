@@ -229,10 +229,10 @@ func TestRemoveHopByHopHeaders(t *testing.T) {
 }
 
 func TestConfiguredACMEDomain(t *testing.T) {
-	t.Run("uses default when env is empty", func(t *testing.T) {
+	t.Run("returns empty string when env is empty", func(t *testing.T) {
 		t.Setenv(acmeDomainEnv, "")
-		if got := configuredACMEDomain(); got != defaultACMEDomain {
-			t.Fatalf("configuredACMEDomain() = %q, want %q", got, defaultACMEDomain)
+		if got := configuredACMEDomain(); got != "" {
+			t.Fatalf("configuredACMEDomain() = %q, want %q", got, "")
 		}
 	})
 
@@ -260,6 +260,19 @@ func TestConfiguredACMEDomain(t *testing.T) {
 			t.Fatalf("configuredACMEDomain() = %q, want %q", got, want)
 		}
 	})
+}
+
+func TestSelfSignedTLSConfig(t *testing.T) {
+	cfg, err := selfSignedTLSConfig()
+	if err != nil {
+		t.Fatalf("selfSignedTLSConfig() error = %v", err)
+	}
+	if len(cfg.Certificates) != 1 {
+		t.Fatalf("len(Certificates) = %d, want 1", len(cfg.Certificates))
+	}
+	if cfg.Certificates[0].PrivateKey == nil {
+		t.Fatal("certificate has nil private key")
+	}
 }
 
 func TestListenerHostPort(t *testing.T) {
