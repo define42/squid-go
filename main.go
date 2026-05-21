@@ -1,6 +1,5 @@
 package main
 
-
 import (
 	"context"
 	"crypto/ecdsa"
@@ -14,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -27,10 +27,6 @@ import (
 )
 
 const (
-	// TLS-ALPN-01 requires this service to be reachable on public TCP/443.
-	// You may run directly on :443, or port-forward external 443 to this process.
-	proxyListen = ":443"
-
 	// proxyAuthEnv is the environment variable that holds one or more
 	// sha256(user:password) hex digests, separated by proxyAuthDelimiter.
 	proxyAuthEnv       = "PROXY_AUTH_SHA256"
@@ -38,6 +34,13 @@ const (
 
 	acmeEmail     = "admin@example.com"
 	acmeDomainEnv = "ACME_DOMAIN"
+
+	// listenAddrEnv overrides the TCP address the proxy listens on.
+	// Defaults to ":443".  When running behind NAT or a port-forward you can
+	// choose any local port (e.g. ":8443") as long as external TCP/443 is
+	// forwarded to it so TLS-ALPN-01 ACME challenges still reach the process.
+	listenAddrEnv     = "LISTEN_ADDR"
+	listenAddrDefault = ":443"
 
 	certStoragePath = "./certmagic-storage"
 )
@@ -59,6 +62,7 @@ var httpProxyTransport = &http.Transport{
 
 func main() {
 	acmeDomain := configuredACMEDomain()
+	listenAddr := configuredListenAddr()
 
 	var tlsConfig *tls.Config
 
@@ -72,49 +76,17 @@ func main() {
 
 		tlsConfig = cfg
 	} else {
-		if err := os.MkdirAll(certStoragePath, 0700); err != nil {
-			log.Fatalf("could not create CertMagic storage directory: %v", err)
-		}
-
-		certmagic.Default.Storage = &certmagic.FileStorage{
-			Path: certStoragePath,
-		}
-
-		certmagic.DefaultACME.Email = acmeEmail
-		certmagic.DefaultACME.Agreed = true
-
-		// Let's Encrypt production CA.
-		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
-
-		// No DNS01Solver.
-		// No HTTP-01 listener.
-		// TLS-ALPN-01 is handled through the TLS listener on :443.
-		magic := certmagic.NewDefault()
-
-		// Start certificate management.
-		// CertMagic will obtain/renew certs automatically.
-		if err := magic.ManageSync(context.Background(), []string{acmeDomain}); err != nil {
+		cfg, err := managedTLSConfig(acmeDomain)
+		if err != nil {
 			log.Fatalf("failed to manage certificate for %s: %v", acmeDomain, err)
 		}
-
-		cfg := magic.TLSConfig()
-
-		// Important for a traditional HTTP proxy:
-		// keep HTTP/1.1 enabled because CONNECT tunneling uses Hijacker here.
-		//
-		// Keep acme-tls/1 so TLS-ALPN-01 can work.
-		cfg.NextProtos = []string{
-			"http/1.1",
-			"acme-tls/1",
-		}
-
 		tlsConfig = cfg
 
-		log.Printf("HTTPS proxy listening on https://%s", listenerHostPort(acmeDomain, proxyListen))
+		log.Printf("HTTPS proxy listening on https://%s", listenerHostPort(acmeDomain, listenAddr))
 	}
 
 	server := &http.Server{
-		Addr:              proxyListen,
+		Addr:              listenAddr,
 		Handler:           http.HandlerFunc(proxyHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig:         tlsConfig,
@@ -131,6 +103,44 @@ func configuredACMEDomain() string {
 		return ""
 	}
 	return strings.Trim(domain, "[]")
+}
+
+// configuredListenAddr returns the TCP address the proxy should bind to.
+// It reads the LISTEN_ADDR environment variable and falls back to ":443".
+func configuredListenAddr() string {
+	addr := strings.TrimSpace(os.Getenv(listenAddrEnv))
+	if addr == "" {
+		return listenAddrDefault
+	}
+	return addr
+}
+
+func managedTLSConfig(acmeDomain string) (*tls.Config, error) {
+	if err := os.MkdirAll(certStoragePath, 0700); err != nil {
+		return nil, fmt.Errorf("could not create CertMagic storage directory: %w", err)
+	}
+
+	certmagic.Default.Storage = &certmagic.FileStorage{
+		Path: certStoragePath,
+	}
+
+	certmagic.DefaultACME.Email = acmeEmail
+	certmagic.DefaultACME.Agreed = true
+	certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
+
+	magic := certmagic.NewDefault()
+
+	if err := magic.ManageSync(context.Background(), []string{acmeDomain}); err != nil {
+		return nil, err
+	}
+
+	cfg := magic.TLSConfig()
+	cfg.NextProtos = []string{
+		"http/1.1",
+		"acme-tls/1",
+	}
+
+	return cfg, nil
 }
 
 // selfSignedTLSConfig generates an ephemeral ECDSA P-256 key and a

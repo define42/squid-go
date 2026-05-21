@@ -7,9 +7,13 @@ TLS certificate management uses the `ACME_DOMAIN` environment variable.
 Set it to the public DNS name or IP address that should receive the
 certificate (e.g. `proxy.example.com` or `203.0.113.8`).
 
-When `ACME_DOMAIN` is set, the proxy uses Let's Encrypt (TLS-ALPN-01) to
-obtain and renew a certificate automatically. The service must be reachable
-on public TCP/443 for this to work.
+When `ACME_DOMAIN` is set, the proxy uses Let's Encrypt with the
+TLS-ALPN-01 challenge to obtain and renew a certificate automatically.
+Let's Encrypt issues certificates for both DNS names and IP addresses
+through this flow. Public TCP/443 must reach the process for issuance
+and renewal. If you run the process on a non-standard local port (see
+`LISTEN_ADDR` below), port-forward external TCP/443 to that local port
+so challenge traffic still reaches the process.
 
 When `ACME_DOMAIN` is unset or empty, the proxy starts with an ephemeral
 self-signed certificate generated at startup. No domain or public reachability
@@ -34,3 +38,18 @@ export PROXY_AUTH_SHA256="<sha256-of-user1:pass1>,<sha256-of-user2:pass2>"
 ```
 
 If `PROXY_AUTH_SHA256` is empty or unset, all proxy requests are rejected.
+
+## Listen address
+
+The `LISTEN_ADDR` environment variable controls the local TCP address the
+proxy binds to. It defaults to `:443`.
+
+```sh
+# Listen on port 8443 while port-forwarding external 443 → local 8443
+export LISTEN_ADDR=":8443"
+./squid-go
+```
+
+This is useful when running behind a load balancer or NAT that forwards
+public TCP/443 to a non-privileged local port. TLS-ALPN-01 certificate
+validation still works as long as external TCP/443 reaches the process.
