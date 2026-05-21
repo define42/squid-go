@@ -1,0 +1,17 @@
+services:
+  squid-go:
+    build:
+      context: .
+    ports:
+      - "443:443"
+    environment:
+      ACME_DOMAIN: proxy.example.com
+      ACME_EMAIL: ops@example.com
+      PROXY_AUTH_SHA256: ${PROXY_AUTH_SHA256:?set PROXY_AUTH_SHA256 to a sha256(user:password) digest}
+      CERT_STORAGE_PATH: /var/lib/squid-go
+    volumes:
+      - squid-go-certs:/var/lib/squid-go
+    restart: unless-stopped
+
+volumes:
+  squid-go-certs:

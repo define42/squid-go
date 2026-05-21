@@ -66,6 +66,21 @@ docker run --rm -p 443:443 \
 external TCP/443 must reach it so Let's Encrypt can complete the
 TLS-ALPN-01 challenge.
 
+### Run with Docker Compose
+
+The repository includes a Compose example at
+[`docker-compose.example.yml`](./docker-compose.example.yml). Update
+`ACME_DOMAIN` and `ACME_EMAIL` in that file, then export a digest for
+`PROXY_AUTH_SHA256` before starting it:
+
+```sh
+export PROXY_AUTH_SHA256="$(printf '%s' 'alice:s3cret' | sha256sum | awk '{print $1}')"
+docker compose -f docker-compose.example.yml up --build -d
+```
+
+The example publishes TCP/443 and stores issued certificates in the
+named volume `squid-go-certs`.
+
 ## Configuration
 
 All configuration is via environment variables.
