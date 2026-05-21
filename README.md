@@ -25,6 +25,13 @@ When `ACME_DOMAIN` is unset or empty, the proxy starts with an ephemeral
 self-signed certificate generated at startup. No domain or public reachability
 is required in this mode.
 
+The directory where ACME account keys and issued certificates are stored
+is controlled by the `CERT_STORAGE_PATH` environment variable. It defaults
+to `./certmagic-storage` (resolved relative to the working directory) and
+must be writable by the process. The Docker image ships with this set to
+`/var/lib/squid-go`, which is created with the correct ownership for the
+non-root runtime user.
+
 Proxy authentication is configured via the `PROXY_AUTH_SHA256` environment
 variable. Its value is a list of `sha256(user:password)` hex digests,
 separated by commas (`,`). Each digest authorises the corresponding
@@ -45,15 +52,41 @@ export PROXY_AUTH_SHA256="<sha256-of-user1:pass1>,<sha256-of-user2:pass2>"
 
 If `PROXY_AUTH_SHA256` is empty or unset, all proxy requests are rejected.
 
+## CONNECT tunnels
+
+The proxy permits HTTP `CONNECT` tunnels only to ports listed in the
+`CONNECT_ALLOWED_PORTS` environment variable. The default is `443`, so
+without configuration only standard HTTPS tunnels are accepted. To allow
+additional ports (for example alternative HTTPS endpoints), set a
+comma-separated list:
+
+```sh
+export CONNECT_ALLOWED_PORTS="443,8443"
+```
+
+CONNECT requests to any other port are rejected with HTTP 403.
+
 ## SSRF protection
 
 Both `CONNECT` and plain-HTTP forwarding resolve the requested target
 once and refuse to dial any address in a private, loopback, link-local,
-unspecified, or multicast range. This blocks SSRF pivoting into the
-host's internal network and cloud metadata endpoints (e.g.
-`169.254.169.254`). The resolved IP is dialed directly so DNS
-rebinding cannot redirect an already-validated hostname onto an
+unspecified, multicast, or carrier-grade-NAT (`100.64.0.0/10`) range.
+TEST-NET ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`),
+the RFC 2544 benchmark range (`198.18.0.0/15`), the limited broadcast
+address (`255.255.255.255`), and the IPv6 documentation prefix
+(`2001:db8::/32`) are also blocked. IPv4-mapped IPv6 addresses are
+unwrapped before classification so they cannot smuggle a private IPv4
+destination through an IPv6 literal. The resolved IP is dialled directly
+so DNS rebinding cannot redirect an already-validated hostname onto an
 internal address.
+
+## Graceful shutdown
+
+The proxy installs a SIGINT / SIGTERM handler that drains in-flight
+requests before exiting. Active CONNECT tunnels are given up to 30
+seconds to complete; afterwards they are closed. This is the standard
+container-orchestrator stop signal, so rolling deploys on Kubernetes,
+ECS, or systemd do not abruptly sever client connections.
 
 ## Listen address
 

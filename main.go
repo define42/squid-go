@@ -20,7 +20,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -46,7 +49,17 @@ const (
 	listenAddrEnv     = "LISTEN_ADDR"
 	listenAddrDefault = ":443"
 
-	certStoragePath = "./certmagic-storage"
+	// certStoragePathEnv overrides the directory where CertMagic stores the
+	// ACME account key and issued certificates. Defaults to certStoragePathDefault.
+	// Operators running in read-only filesystems (e.g. distroless containers)
+	// must point this at a writable volume.
+	certStoragePathEnv     = "CERT_STORAGE_PATH"
+	certStoragePathDefault = "./certmagic-storage"
+
+	// connectPortsEnv is a comma-separated allow-list of TCP ports the proxy
+	// permits as CONNECT targets. Defaults to "443" (HTTPS only).
+	connectPortsEnv     = "CONNECT_ALLOWED_PORTS"
+	connectPortsDefault = "443"
 )
 
 var httpProxyTransport = &http.Transport{
@@ -59,6 +72,7 @@ var httpProxyTransport = &http.Transport{
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 30 * time.Second,
 }
 
 // errBlockedAddress is returned when the requested target resolves to an
@@ -122,17 +136,55 @@ func resolveSafeIP(ctx context.Context, host string) (net.IP, error) {
 	return nil, errBlockedAddress
 }
 
+// extraBlockedCIDRs lists ranges that Go's net.IP helpers do not classify
+// as private/loopback/link-local but which the proxy still refuses to
+// forward to. Notably:
+//   - 100.64.0.0/10  RFC 6598 carrier-grade NAT (often used for cloud
+//     management networks and internal load balancers)
+//   - 192.0.0.0/24   RFC 6890 IETF protocol assignments
+//   - 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24  TEST-NET docs
+//   - 198.18.0.0/15  RFC 2544 benchmark
+//   - 255.255.255.255/32  limited broadcast
+var extraBlockedCIDRs = func() []*net.IPNet {
+	cidrs := []string{
+		"100.64.0.0/10",
+		"192.0.0.0/24",
+		"192.0.2.0/24",
+		"198.18.0.0/15",
+		"198.51.100.0/24",
+		"203.0.113.0/24",
+		"255.255.255.255/32",
+		"2001:db8::/32",
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, s := range cidrs {
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			panic(fmt.Sprintf("invalid built-in CIDR %q: %v", s, err))
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
 // isBlockedIP reports whether ip is in a range the proxy refuses to
 // forward to. Blocking these ranges prevents SSRF pivoting into the
 // host's loopback interface, RFC1918/ULA networks, link-local ranges
-// (including cloud metadata at 169.254.169.254 and fe80::/10), and
-// unspecified/multicast destinations.
+// (including cloud metadata at 169.254.169.254 and fe80::/10), CGNAT
+// (100.64.0.0/10), and unspecified/multicast destinations.
+//
+// IPv4-mapped IPv6 addresses (::ffff:0:0/96) are unwrapped to their
+// underlying IPv4 form before classification so they cannot be used to
+// smuggle a private IPv4 destination through an IPv6 literal.
 //
 // Declared as a var so tests that need to dial loopback fixtures can
 // override it. Production code never reassigns it.
 var isBlockedIP = func(ip net.IP) bool {
 	if ip == nil {
 		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
 	}
 	if ip.IsLoopback() ||
 		ip.IsPrivate() ||
@@ -143,12 +195,28 @@ var isBlockedIP = func(ip net.IP) bool {
 		ip.IsUnspecified() {
 		return true
 	}
+	for _, n := range extraBlockedCIDRs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
 	return false
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	acmeDomain := configuredACMEDomain()
 	listenAddr := configuredListenAddr()
+
+	allowedPorts, err := configuredConnectPorts()
+	if err != nil {
+		return fmt.Errorf("invalid %s: %w", connectPortsEnv, err)
+	}
 
 	var tlsConfig *tls.Config
 
@@ -157,34 +225,64 @@ func main() {
 
 		cfg, err := selfSignedTLSConfig()
 		if err != nil {
-			log.Fatalf("failed to generate self-signed certificate: %v", err)
+			return fmt.Errorf("failed to generate self-signed certificate: %w", err)
 		}
-
 		tlsConfig = cfg
 	} else {
 		acmeEmail, err := configuredACMEEmail()
 		if err != nil {
-			log.Fatalf("invalid ACME configuration: %v", err)
+			return fmt.Errorf("invalid ACME configuration: %w", err)
 		}
 
 		cfg, err := managedTLSConfig(acmeDomain, acmeEmail)
 		if err != nil {
-			log.Fatalf("failed to manage certificate for %s: %v", acmeDomain, err)
+			return fmt.Errorf("failed to manage certificate for %s: %w", acmeDomain, err)
 		}
 		tlsConfig = cfg
 
 		log.Printf("HTTPS proxy listening on https://%s", listenerHostPort(acmeDomain, listenAddr))
 	}
 
+	handler := newProxyHandler(allowedPorts)
+
 	server := &http.Server{
 		Addr:              listenAddr,
-		Handler:           http.HandlerFunc(proxyHandler),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig:         tlsConfig,
+		// WriteTimeout is intentionally unset: long-lived CONNECT tunnels
+		// would otherwise be killed mid-stream.
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MiB
+		TLSConfig:      tlsConfig,
 	}
 
-	if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		err := server.ListenAndServeTLS("", "")
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("shutdown signal received; draining connections")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
+		// Wait for the serve goroutine to finish so we don't return while
+		// it may still be writing to the server's TLS listener.
+		<-serverErr
+		return nil
+	case err := <-serverErr:
+		return err
 	}
 }
 
@@ -204,6 +302,69 @@ func configuredListenAddr() string {
 		return listenAddrDefault
 	}
 	return addr
+}
+
+// configuredCertStoragePath returns the absolute path where CertMagic
+// should store account keys and issued certificates. It reads the
+// CERT_STORAGE_PATH environment variable and falls back to a default
+// directory beside the binary.
+func configuredCertStoragePath() (string, error) {
+	p := strings.TrimSpace(os.Getenv(certStoragePathEnv))
+	if p == "" {
+		p = certStoragePathDefault
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("resolving %s=%q: %w", certStoragePathEnv, p, err)
+	}
+	return abs, nil
+}
+
+// configuredConnectPorts returns the set of TCP ports the proxy is willing
+// to tunnel via CONNECT. The CONNECT_ALLOWED_PORTS env var contains a
+// comma-separated list; whitespace and empty entries are ignored. Each
+// entry must be a decimal integer in the valid TCP range.
+func configuredConnectPorts() (map[string]struct{}, error) {
+	raw := strings.TrimSpace(os.Getenv(connectPortsEnv))
+	if raw == "" {
+		raw = connectPortsDefault
+	}
+	out := make(map[string]struct{})
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		n, err := parsePort(p)
+		if err != nil {
+			return nil, err
+		}
+		out[fmt.Sprintf("%d", n)] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no ports configured")
+	}
+	return out, nil
+}
+
+func parsePort(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty port")
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("invalid port %q", s)
+		}
+		n = n*10 + int(c-'0')
+		if n > 65535 {
+			return 0, fmt.Errorf("invalid port %q", s)
+		}
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("invalid port %q", s)
+	}
+	return n, nil
 }
 
 // configuredACMEEmail returns the contact email used to register the
@@ -230,12 +391,16 @@ func configuredACMEEmail() (string, error) {
 }
 
 func managedTLSConfig(acmeDomain, acmeEmail string) (*tls.Config, error) {
-	if err := os.MkdirAll(certStoragePath, 0700); err != nil {
-		return nil, fmt.Errorf("could not create CertMagic storage directory: %w", err)
+	storagePath, err := configuredCertStoragePath()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(storagePath, 0700); err != nil {
+		return nil, fmt.Errorf("could not create CertMagic storage directory %q: %w", storagePath, err)
 	}
 
 	certmagic.Default.Storage = &certmagic.FileStorage{
-		Path: certStoragePath,
+		Path: storagePath,
 	}
 
 	certmagic.DefaultACME.Email = acmeEmail
@@ -305,19 +470,31 @@ func listenerHostPort(host, addr string) string {
 	return net.JoinHostPort(host, port)
 }
 
-func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	if !authorized(r) {
-		w.Header().Set("Proxy-Authenticate", `Basic realm="go-https-proxy"`)
-		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
-		return
-	}
+// newProxyHandler returns an http.Handler that authenticates inbound
+// requests and dispatches CONNECT vs plain-HTTP traffic. allowedPorts
+// is the set of TCP ports the proxy is willing to tunnel via CONNECT;
+// all other ports are rejected with 403 Forbidden.
+func newProxyHandler(allowedPorts map[string]struct{}) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r) {
+			w.Header().Set("Proxy-Authenticate", `Basic realm="go-https-proxy"`)
+			http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+			return
+		}
 
-	switch r.Method {
-	case http.MethodConnect:
-		handleConnect(w, r)
-	default:
-		handlePlainHTTP(w, r)
-	}
+		switch r.Method {
+		case http.MethodConnect:
+			handleConnect(w, r, allowedPorts)
+		default:
+			handlePlainHTTP(w, r)
+		}
+	})
+}
+
+// proxyHandler is the package-default handler used by tests. It permits
+// CONNECT to port 443 only, mirroring the historical behavior.
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	newProxyHandler(map[string]struct{}{"443": {}}).ServeHTTP(w, r)
 }
 
 func authorized(r *http.Request) bool {
@@ -336,7 +513,8 @@ func authorized(r *http.Request) bool {
 		return false
 	}
 
-	// Require a non-empty "user:password" pair.
+	// Require a non-empty user and non-empty password. RFC 7617 forbids
+	// `:` in the userid; the first colon delimits the two fields.
 	colon := strings.IndexByte(string(raw), ':')
 	if colon <= 0 || colon == len(raw)-1 {
 		return false
@@ -385,7 +563,7 @@ func allowedAuthHashes() []string {
 	return hashes
 }
 
-func handleConnect(w http.ResponseWriter, r *http.Request) {
+func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[string]struct{}) {
 	target := r.Host
 
 	host, port, err := net.SplitHostPort(target)
@@ -394,10 +572,16 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Safety rule:
-	// only allow tunneling to normal HTTPS targets.
-	if port != "443" {
-		http.Error(w, "CONNECT only allowed to port 443", http.StatusForbidden)
+	// Reject hostnames containing characters that would confuse downstream
+	// parsing (zone IDs, control bytes). net.SplitHostPort already strips
+	// brackets from IPv6 literals.
+	if strings.ContainsAny(host, "%\x00") {
+		http.Error(w, "bad CONNECT target", http.StatusBadRequest)
+		return
+	}
+
+	if _, ok := allowedPorts[port]; !ok {
+		http.Error(w, "CONNECT to this port is not allowed", http.StatusForbidden)
 		return
 	}
 
@@ -426,8 +610,14 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
-	_ = buffered.Flush()
+	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		log.Printf("CONNECT %s: write 200: %v", target, err)
+		return
+	}
+	if err := buffered.Flush(); err != nil {
+		log.Printf("CONNECT %s: flush 200: %v", target, err)
+		return
+	}
 
 	// Any bytes the client pipelined immediately after the CONNECT request
 	// (typically the TLS ClientHello) may already sit in the bufio.Reader.
@@ -442,16 +632,15 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("CONNECT %s", target)
 
+	// Splice both directions and wait for BOTH to finish before returning.
+	// The first goroutine to exit calls SetDeadline on both ends so that
+	// the peer goroutine's blocked Read unblocks promptly. Waiting for
+	// both ensures we don't close the underlying connections while the
+	// other direction is still writing in-flight bytes.
 	errCh := make(chan error, 2)
-
-	go func() {
-		errCh <- proxyCopy(dstConn, clientConn)
-	}()
-
-	go func() {
-		errCh <- proxyCopy(clientConn, dstConn)
-	}()
-
+	go func() { errCh <- proxyCopy(dstConn, clientConn) }()
+	go func() { errCh <- proxyCopy(clientConn, dstConn) }()
+	<-errCh
 	<-errCh
 }
 
@@ -499,18 +688,43 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
-	_, _ = io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("%s %s -> %d: response body copy: %v", r.Method, r.URL.String(), resp.StatusCode, err)
+		return
+	}
 
 	log.Printf("%s %s -> %d", r.Method, r.URL.String(), resp.StatusCode)
 }
 
+// proxyCopy splices data from src to dst. When src reports EOF, it
+// propagates a half-close to dst (via CloseWrite if available) so the
+// peer of the other copy direction observes EOF and finishes its own
+// io.Copy naturally. On any non-EOF error it sets immediate deadlines
+// on both sides so the sibling goroutine unblocks. Returns the
+// underlying error (nil on a clean EOF).
 func proxyCopy(dst net.Conn, src net.Conn) error {
 	_, err := io.Copy(dst, src)
-
+	if err == nil {
+		// Clean EOF on the read side. Half-close the write side of dst
+		// to forward EOF without disturbing the other direction.
+		if cw, ok := dst.(closeWriter); ok {
+			_ = cw.CloseWrite()
+			return nil
+		}
+	}
+	// Error path (or no half-close support): force the sibling to
+	// unblock by tripping read/write deadlines. The deferred Close()
+	// in handleConnect tears the connections down once both copies
+	// have returned.
 	_ = dst.SetDeadline(time.Now())
 	_ = src.SetDeadline(time.Now())
-
 	return err
+}
+
+// closeWriter is implemented by *net.TCPConn and *tls.Conn for clean
+// TCP half-close semantics.
+type closeWriter interface {
+	CloseWrite() error
 }
 
 func copyHeader(dst, src http.Header) {
