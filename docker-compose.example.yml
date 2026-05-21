@@ -11,6 +11,9 @@ services:
       CERT_STORAGE_PATH: /var/lib/squid-go
     volumes:
       - squid-go-certs:/var/lib/squid-go
+    read_only: true
+    cap_drop:
+      - ALL
     restart: unless-stopped
 
 volumes:
