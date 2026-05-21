@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
@@ -66,7 +67,7 @@ func main() {
 
 	// Start certificate management.
 	// CertMagic will obtain/renew certs automatically.
-	if err := magic.ManageSync([]string{acmeDomain}); err != nil {
+	if err := magic.ManageSync(context.Background(), []string{acmeDomain}); err != nil {
 		log.Fatalf("failed to manage certificate for %s: %v", acmeDomain, err)
 	}
 
