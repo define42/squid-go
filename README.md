@@ -3,6 +3,18 @@ A Squid proxy in Golang
 
 ## Configuration
 
+TLS certificate management uses the `ACME_DOMAIN` environment variable.
+Set it to the public DNS name or IP address that should receive the
+certificate (e.g. `proxy.example.com` or `203.0.113.8`).
+
+When `ACME_DOMAIN` is set, the proxy uses Let's Encrypt (TLS-ALPN-01) to
+obtain and renew a certificate automatically. The service must be reachable
+on public TCP/443 for this to work.
+
+When `ACME_DOMAIN` is unset or empty, the proxy starts with an ephemeral
+self-signed certificate generated at startup. No domain or public reachability
+is required in this mode.
+
 Proxy authentication is configured via the `PROXY_AUTH_SHA256` environment
 variable. Its value is a list of `sha256(user:password)` hex digests,
 separated by commas (`,`). Each digest authorises the corresponding
