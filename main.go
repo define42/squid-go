@@ -20,7 +20,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,10 +32,8 @@ const (
 	proxyAuthEnv       = "PROXY_AUTH_SHA256"
 	proxyAuthDelimiter = ","
 
-	acmeEmail        = "admin@example.com"
-	acmeDomainEnv    = "ACME_DOMAIN"
-	zeroSSLAPIKeyEnv = "ZEROSSL_API_KEY"
-	acmeHTTPPortEnv  = "ACME_HTTP_PORT"
+	acmeEmail     = "admin@example.com"
+	acmeDomainEnv = "ACME_DOMAIN"
 
 	// listenAddrEnv overrides the TCP address the proxy listens on.
 	// Defaults to ":443".  When running behind NAT or a port-forward you can
@@ -108,24 +105,6 @@ func configuredACMEDomain() string {
 	return strings.Trim(domain, "[]")
 }
 
-func configuredZeroSSLAPIKey() string {
-	return strings.TrimSpace(os.Getenv(zeroSSLAPIKeyEnv))
-}
-
-func configuredACMEHTTPPort() (int, error) {
-	raw := strings.TrimSpace(os.Getenv(acmeHTTPPortEnv))
-	if raw == "" {
-		return 0, nil
-	}
-
-	port, err := strconv.Atoi(raw)
-	if err != nil || port < 1 || port > 65535 {
-		return 0, fmt.Errorf("%s must be a valid TCP port (1-65535), got %q", acmeHTTPPortEnv, raw)
-	}
-
-	return port, nil
-}
-
 // configuredListenAddr returns the TCP address the proxy should bind to.
 // It reads the LISTEN_ADDR environment variable and falls back to ":443".
 func configuredListenAddr() string {
@@ -150,9 +129,6 @@ func managedTLSConfig(acmeDomain string) (*tls.Config, error) {
 	certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
 
 	magic := certmagic.NewDefault()
-	if err := configureManagedIssuers(magic, acmeDomain); err != nil {
-		return nil, err
-	}
 
 	if err := magic.ManageSync(context.Background(), []string{acmeDomain}); err != nil {
 		return nil, err
@@ -165,32 +141,6 @@ func managedTLSConfig(acmeDomain string) (*tls.Config, error) {
 	}
 
 	return cfg, nil
-}
-
-func configureManagedIssuers(magic *certmagic.Config, acmeDomain string) error {
-	if net.ParseIP(acmeDomain) == nil {
-		return nil
-	}
-
-	apiKey := configuredZeroSSLAPIKey()
-	if apiKey == "" {
-		return fmt.Errorf("%s must be set when %s is an IP address", zeroSSLAPIKeyEnv, acmeDomainEnv)
-	}
-
-	altHTTPPort, err := configuredACMEHTTPPort()
-	if err != nil {
-		return err
-	}
-
-	magic.Issuers = []certmagic.Issuer{
-		&certmagic.ZeroSSLIssuer{
-			APIKey:      apiKey,
-			Storage:     magic.Storage,
-			AltHTTPPort: altHTTPPort,
-		},
-	}
-
-	return nil
 }
 
 // selfSignedTLSConfig generates an ephemeral ECDSA P-256 key and a
