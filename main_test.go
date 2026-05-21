@@ -228,6 +228,32 @@ func TestRemoveHopByHopHeaders(t *testing.T) {
 	}
 }
 
+func TestConfiguredListenAddr(t *testing.T) {
+	t.Run("defaults to :443 when env is empty", func(t *testing.T) {
+		t.Setenv(listenAddrEnv, "")
+		if got := configuredListenAddr(); got != listenAddrDefault {
+			t.Fatalf("configuredListenAddr() = %q, want %q", got, listenAddrDefault)
+		}
+	})
+
+	t.Run("uses address from env", func(t *testing.T) {
+		want := ":8443"
+		t.Setenv(listenAddrEnv, want)
+		if got := configuredListenAddr(); got != want {
+			t.Fatalf("configuredListenAddr() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("trims whitespace", func(t *testing.T) {
+		want := ":9443"
+		t.Setenv(listenAddrEnv, "  "+want+"  ")
+		if got := configuredListenAddr(); got != want {
+			t.Fatalf("configuredListenAddr() = %q, want %q", got, want)
+		}
+	})
+}
+
+
 func TestConfiguredACMEDomain(t *testing.T) {
 	t.Run("returns empty string when env is empty", func(t *testing.T) {
 		t.Setenv(acmeDomainEnv, "")
