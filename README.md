@@ -7,11 +7,19 @@ TLS certificate management uses the `ACME_DOMAIN` environment variable.
 Set it to the public DNS name or IP address that should receive the
 certificate (e.g. `proxy.example.com` or `203.0.113.8`).
 
-When `ACME_DOMAIN` is set, the proxy uses Let's Encrypt (TLS-ALPN-01) to
-obtain and renew a certificate automatically. The service must be reachable
-on public TCP/443 for this to work. If you run the process on a non-standard
-port (see `LISTEN_ADDR` below), port-forward external TCP/443 to that local
-port so challenge traffic still reaches the process.
+When `ACME_DOMAIN` is a DNS name, the proxy uses Let's Encrypt with the
+TLS-ALPN-01 challenge. Public TCP/443 must reach the process for issuance
+and renewal. If you run the process on a non-standard local port (see
+`LISTEN_ADDR` below), port-forward external TCP/443 to that local port.
+
+When `ACME_DOMAIN` is an IP address, the proxy uses ZeroSSL's API because
+IP certificates are not handled by the Let's Encrypt ACME path used for DNS
+names here. In this mode:
+
+- `ZEROSSL_API_KEY` is required
+- public TCP/80 must reach the temporary HTTP validation listener
+- if validation traffic is port-forwarded to a non-standard local port, set
+  `ACME_HTTP_PORT` to that local port
 
 When `ACME_DOMAIN` is unset or empty, the proxy starts with an ephemeral
 self-signed certificate generated at startup. No domain or public reachability
@@ -51,3 +59,21 @@ export LISTEN_ADDR=":8443"
 This is useful when running behind a load balancer or NAT that forwards
 public TCP/443 to a non-privileged local port. TLS-ALPN-01 certificate
 validation still works as long as external TCP/443 reaches the process.
+
+## IP certificate validation
+
+For IP certificates, ZeroSSL validation uses HTTP reachability instead of the
+TLS-ALPN flow used for DNS names.
+
+```sh
+export ACME_DOMAIN="203.0.113.8"
+export ZEROSSL_API_KEY="<your-zerossl-api-key>"
+
+# Optional: if external TCP/80 is forwarded to a different local port
+export ACME_HTTP_PORT="8080"
+
+./squid-go
+```
+
+If `ACME_HTTP_PORT` is set, forward public TCP/80 to that local port so the
+ZeroSSL validation server can answer the challenge.

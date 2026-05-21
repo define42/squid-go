@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/caddyserver/certmagic"
 )
 
 const (
@@ -253,6 +255,98 @@ func TestConfiguredListenAddr(t *testing.T) {
 	})
 }
 
+func TestConfiguredZeroSSLAPIKey(t *testing.T) {
+	t.Run("returns empty string when env is empty", func(t *testing.T) {
+		t.Setenv(zeroSSLAPIKeyEnv, "")
+		if got := configuredZeroSSLAPIKey(); got != "" {
+			t.Fatalf("configuredZeroSSLAPIKey() = %q, want empty string", got)
+		}
+	})
+
+	t.Run("trims whitespace", func(t *testing.T) {
+		want := "zerossl-api-key"
+		t.Setenv(zeroSSLAPIKeyEnv, "  "+want+"  ")
+		if got := configuredZeroSSLAPIKey(); got != want {
+			t.Fatalf("configuredZeroSSLAPIKey() = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestConfiguredACMEHTTPPort(t *testing.T) {
+	t.Run("defaults to zero when env is empty", func(t *testing.T) {
+		t.Setenv(acmeHTTPPortEnv, "")
+		got, err := configuredACMEHTTPPort()
+		if err != nil {
+			t.Fatalf("configuredACMEHTTPPort() error = %v", err)
+		}
+		if got != 0 {
+			t.Fatalf("configuredACMEHTTPPort() = %d, want 0", got)
+		}
+	})
+
+	t.Run("uses port from env", func(t *testing.T) {
+		t.Setenv(acmeHTTPPortEnv, "8080")
+		got, err := configuredACMEHTTPPort()
+		if err != nil {
+			t.Fatalf("configuredACMEHTTPPort() error = %v", err)
+		}
+		if got != 8080 {
+			t.Fatalf("configuredACMEHTTPPort() = %d, want 8080", got)
+		}
+	})
+
+	t.Run("rejects invalid port", func(t *testing.T) {
+		t.Setenv(acmeHTTPPortEnv, "abc")
+		if _, err := configuredACMEHTTPPort(); err == nil {
+			t.Fatal("configuredACMEHTTPPort() error = nil, want error")
+		}
+	})
+}
+
+func TestConfigureManagedIssuers(t *testing.T) {
+	t.Run("keeps default ACME issuer for DNS names", func(t *testing.T) {
+		cfg := certmagic.NewDefault()
+		if err := configureManagedIssuers(cfg, "proxy.example.com"); err != nil {
+			t.Fatalf("configureManagedIssuers() error = %v", err)
+		}
+		if len(cfg.Issuers) != 1 {
+			t.Fatalf("len(cfg.Issuers) = %d, want 1", len(cfg.Issuers))
+		}
+		if _, ok := cfg.Issuers[0].(*certmagic.ACMEIssuer); !ok {
+			t.Fatalf("issuer type = %T, want *certmagic.ACMEIssuer", cfg.Issuers[0])
+		}
+	})
+
+	t.Run("requires ZeroSSL API key for IP addresses", func(t *testing.T) {
+		t.Setenv(zeroSSLAPIKeyEnv, "")
+		cfg := certmagic.NewDefault()
+		if err := configureManagedIssuers(cfg, "203.0.113.8"); err == nil {
+			t.Fatal("configureManagedIssuers() error = nil, want error")
+		}
+	})
+
+	t.Run("uses ZeroSSL issuer for IP addresses", func(t *testing.T) {
+		t.Setenv(zeroSSLAPIKeyEnv, "api-key")
+		t.Setenv(acmeHTTPPortEnv, "8080")
+		cfg := certmagic.NewDefault()
+		if err := configureManagedIssuers(cfg, "203.0.113.8"); err != nil {
+			t.Fatalf("configureManagedIssuers() error = %v", err)
+		}
+		if len(cfg.Issuers) != 1 {
+			t.Fatalf("len(cfg.Issuers) = %d, want 1", len(cfg.Issuers))
+		}
+		issuer, ok := cfg.Issuers[0].(*certmagic.ZeroSSLIssuer)
+		if !ok {
+			t.Fatalf("issuer type = %T, want *certmagic.ZeroSSLIssuer", cfg.Issuers[0])
+		}
+		if issuer.APIKey != "api-key" {
+			t.Fatalf("issuer.APIKey = %q, want %q", issuer.APIKey, "api-key")
+		}
+		if issuer.AltHTTPPort != 8080 {
+			t.Fatalf("issuer.AltHTTPPort = %d, want 8080", issuer.AltHTTPPort)
+		}
+	})
+}
 
 func TestConfiguredACMEDomain(t *testing.T) {
 	t.Run("returns empty string when env is empty", func(t *testing.T) {
