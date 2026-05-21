@@ -4,18 +4,72 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to release
+        required: true
+        type: string
 
 permissions:
   contents: write
   packages: write
 
 jobs:
+  prepare:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "No version tag was provided" >&2
+            exit 1
+          fi
+
+          for _ in 1 2 3 4 5; do
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              break
+            fi
+            git fetch --force --tags origin
+            sleep 2
+          done
+
+          sha="$(git rev-list -n 1 "$tag" 2>/dev/null || true)"
+
+          if [ -z "$sha" ]; then
+            echo "No commit found for version tag $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   test:
     name: Test before release
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -31,7 +85,9 @@ jobs:
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-    needs: test
+    needs:
+      - prepare
+      - test
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -50,6 +106,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -64,7 +122,7 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir -p dist
-          out="dist/squid-go-${GITHUB_REF_NAME}-${GOOS}-${GOARCH}${{ matrix.ext }}"
+          out="dist/squid-go-${{ needs.prepare.outputs.tag }}-${GOOS}-${GOARCH}${{ matrix.ext }}"
           go build -trimpath -ldflags "-s -w" -o "$out" .
           echo "ARTIFACT=$out" >> "$GITHUB_ENV"
 
@@ -77,7 +135,9 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs:
+      - prepare
+      - build
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
@@ -89,16 +149,22 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.sha }}
           files: dist/*
           generate_release_notes: true
 
   docker:
     name: Build & push Docker image
-    needs: test
+    needs:
+      - prepare
+      - test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -119,9 +185,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.tag }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
