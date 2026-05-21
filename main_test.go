@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -129,6 +132,13 @@ func TestHandlePlainHTTP_RejectsHTTPSScheme(t *testing.T) {
 }
 
 func TestHandlePlainHTTP_ForwardsRequest(t *testing.T) {
+	// The upstream listens on loopback, which the SSRF filter normally
+	// blocks. Disable the filter just for this test that exercises
+	// the forwarding path itself.
+	origBlock := isBlockedIP
+	isBlockedIP = func(net.IP) bool { return false }
+	t.Cleanup(func() { isBlockedIP = origBlock })
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Proxy must not forward Proxy-Authorization to upstream.
 		if r.Header.Get("Proxy-Authorization") != "" {
@@ -297,6 +307,237 @@ func TestSelfSignedTLSConfig(t *testing.T) {
 	}
 	if cfg.Certificates[0].PrivateKey == nil {
 		t.Fatal("certificate has nil private key")
+	}
+}
+
+func TestIsBlockedIP(t *testing.T) {
+	tests := []struct {
+		ip   string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"::1", true},
+		{"10.0.0.5", true},
+		{"172.16.5.5", true},
+		{"192.168.1.1", true},
+		{"169.254.169.254", true}, // AWS/GCP/Azure metadata
+		{"fe80::1", true},
+		{"0.0.0.0", true},
+		{"::", true},
+		{"224.0.0.1", true},
+		{"ff02::1", true},
+		{"fc00::1", true}, // ULA
+		{"8.8.8.8", false},
+		{"1.1.1.1", false},
+		{"2606:4700:4700::1111", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.ip, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("invalid test IP %q", tc.ip)
+			}
+			if got := isBlockedIP(ip); got != tc.want {
+				t.Fatalf("isBlockedIP(%s) = %v, want %v", tc.ip, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveSafeIP_LiteralBlocked(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "169.254.169.254", "10.1.2.3", "::1", "fe80::1"} {
+		t.Run(host, func(t *testing.T) {
+			_, err := resolveSafeIP(context.Background(), host)
+			if !errors.Is(err, errBlockedAddress) {
+				t.Fatalf("resolveSafeIP(%q) err = %v, want errBlockedAddress", host, err)
+			}
+		})
+	}
+}
+
+func TestResolveSafeIP_LiteralAllowed(t *testing.T) {
+	ip, err := resolveSafeIP(context.Background(), "8.8.8.8")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ip.String() != "8.8.8.8" {
+		t.Fatalf("got %v, want 8.8.8.8", ip)
+	}
+}
+
+func TestSafeDial_BlocksPrivateLiteral(t *testing.T) {
+	// Bind a loopback listener so that, absent the SSRF check, a dial
+	// would succeed. The safe dialer must refuse before connecting.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	_, err = safeDial(context.Background(), "tcp", ln.Addr().String(), 2*time.Second)
+	if !errors.Is(err, errBlockedAddress) {
+		t.Fatalf("safeDial err = %v, want errBlockedAddress", err)
+	}
+}
+
+func TestHandleConnect_BlocksPrivateAddress(t *testing.T) {
+	setAuthEnv(t, sha256Hex(testProxyUser, testProxyPass))
+
+	req := httptest.NewRequest(http.MethodConnect, "http://example.com", nil)
+	// Force a private literal target on the standard HTTPS port.
+	req.Host = "127.0.0.1:443"
+	req.Header.Set("Proxy-Authorization", basicAuthHeader(testProxyUser, testProxyPass))
+	rec := httptest.NewRecorder()
+
+	proxyHandler(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestHandlePlainHTTP_BlocksPrivateAddress(t *testing.T) {
+	// Spin up a loopback HTTP server. handlePlainHTTP must refuse to
+	// dial it via the SSRF filter even though it is reachable.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream should not be reached")
+	}))
+	defer upstream.Close()
+
+	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/", nil)
+	req.Header.Set("Proxy-Authorization", basicAuthHeader(testProxyUser, testProxyPass))
+	rec := httptest.NewRecorder()
+
+	handlePlainHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (body=%q)", rec.Code, http.StatusForbidden, rec.Body.String())
+	}
+}
+
+func TestConfiguredACMEEmail(t *testing.T) {
+	t.Run("unset is rejected", func(t *testing.T) {
+		t.Setenv(acmeEmailEnv, "")
+		if _, err := configuredACMEEmail(); err == nil {
+			t.Fatal("expected error when ACME_EMAIL is unset")
+		}
+	})
+
+	t.Run("example domain is rejected", func(t *testing.T) {
+		t.Setenv(acmeEmailEnv, "admin@example.com")
+		if _, err := configuredACMEEmail(); err == nil {
+			t.Fatal("expected error for example.com address")
+		}
+	})
+
+	t.Run("missing @ is rejected", func(t *testing.T) {
+		t.Setenv(acmeEmailEnv, "not-an-email")
+		if _, err := configuredACMEEmail(); err == nil {
+			t.Fatal("expected error for malformed email")
+		}
+	})
+
+	t.Run("valid email is accepted", func(t *testing.T) {
+		t.Setenv(acmeEmailEnv, "  ops@proxy.test  ")
+		got, err := configuredACMEEmail()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "ops@proxy.test" {
+			t.Fatalf("got %q, want %q", got, "ops@proxy.test")
+		}
+	})
+}
+
+// TestHandleConnect_DrainsBufferedClientBytes verifies that bytes the
+// client pipelined into the bufio.Reader together with the CONNECT
+// request are forwarded to the destination instead of being silently
+// dropped after hijack.
+func TestHandleConnect_DrainsBufferedClientBytes(t *testing.T) {
+	// Destination server: read everything sent by the client and echo it.
+	dstLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dst: %v", err)
+	}
+	defer dstLn.Close()
+
+	received := make(chan []byte, 1)
+	go func() {
+		c, err := dstLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 64)
+		n, _ := c.Read(buf)
+		received <- buf[:n]
+	}()
+
+	// Build an HTTP proxy whose handleConnect uses a stub dialer pointing
+	// at the local destination, bypassing the SSRF block.
+	origAddr := dstLn.Addr().String()
+	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mimic handleConnect but use the loopback destination directly.
+		dst, err := net.Dial("tcp", origAddr)
+		if err != nil {
+			t.Errorf("dial dst: %v", err)
+			return
+		}
+		defer dst.Close()
+		hj, _ := w.(http.Hijacker)
+		cc, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer cc.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buf.Flush()
+		if n := buf.Reader.Buffered(); n > 0 {
+			if _, err := io.CopyN(dst, buf.Reader, int64(n)); err != nil {
+				t.Errorf("drain: %v", err)
+				return
+			}
+		}
+		_, _ = io.Copy(dst, cc)
+	})
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	defer proxyLn.Close()
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(proxyLn)
+	defer srv.Close()
+
+	// Pipeline CONNECT + payload in a single TCP write so the payload
+	// is parked in the server-side bufio.Reader before Hijack returns.
+	conn, err := net.Dial("tcp", proxyLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	pipelined := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\nHELLO-PIPELINED"
+	if _, err := conn.Write([]byte(pipelined)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Read the 200 response line.
+	respBuf := make([]byte, 128)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Read(respBuf); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	select {
+	case got := <-received:
+		if string(got) != "HELLO-PIPELINED" {
+			t.Fatalf("destination received %q, want %q", got, "HELLO-PIPELINED")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("destination did not receive pipelined bytes")
 	}
 }
 

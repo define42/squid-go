@@ -32,7 +32,11 @@ const (
 	proxyAuthEnv       = "PROXY_AUTH_SHA256"
 	proxyAuthDelimiter = ","
 
-	acmeEmail     = "admin@example.com"
+	// acmeEmailEnv is the environment variable that supplies the contact
+	// email used to register the ACME account with Let's Encrypt. It is
+	// required when running in ACME mode (i.e. when ACME_DOMAIN is set)
+	// so account recovery and expiration notices reach a real mailbox.
+	acmeEmailEnv  = "ACME_EMAIL"
 	acmeDomainEnv = "ACME_DOMAIN"
 
 	// listenAddrEnv overrides the TCP address the proxy listens on.
@@ -48,16 +52,98 @@ const (
 var httpProxyTransport = &http.Transport{
 	Proxy: nil,
 
-	DialContext: (&net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext,
+	DialContext: safeDialContext,
 
 	MaxIdleConns:          100,
 	MaxIdleConnsPerHost:   20,
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 1 * time.Second,
+}
+
+// errBlockedAddress is returned when the requested target resolves to an
+// IP address that the proxy refuses to connect to (loopback, private,
+// link-local, unspecified, multicast, etc.). Blocking these prevents the
+// proxy from being abused for SSRF against the host's internal network
+// and cloud metadata endpoints (e.g. 169.254.169.254).
+var errBlockedAddress = errors.New("target resolves to a blocked address")
+
+// safeDialContext is a net.Dialer-compatible DialContext that resolves the
+// host once, rejects any unsafe IP, and dials the exact resolved IP. This
+// prevents DNS-rebinding attacks where a hostname resolves to a public IP
+// at resolution time but to a private IP at connect time.
+func safeDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return safeDial(ctx, network, address, 10*time.Second)
+}
+
+func safeDial(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+
+	ip, err := resolveSafeIP(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+	}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+}
+
+// resolveSafeIP resolves host to an IP address, returning the first IP
+// that is not blocked by isBlockedIP. If every resolved address is
+// unsafe, it returns errBlockedAddress.
+func resolveSafeIP(ctx context.Context, host string) (net.IP, error) {
+	// If the host is already a literal IP, validate it directly.
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return nil, errBlockedAddress
+		}
+		return ip, nil
+	}
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no addresses found for %s", host)
+	}
+
+	for _, a := range addrs {
+		if !isBlockedIP(a.IP) {
+			return a.IP, nil
+		}
+	}
+	return nil, errBlockedAddress
+}
+
+// isBlockedIP reports whether ip is in a range the proxy refuses to
+// forward to. Blocking these ranges prevents SSRF pivoting into the
+// host's loopback interface, RFC1918/ULA networks, link-local ranges
+// (including cloud metadata at 169.254.169.254 and fe80::/10), and
+// unspecified/multicast destinations.
+//
+// Declared as a var so tests that need to dial loopback fixtures can
+// override it. Production code never reassigns it.
+var isBlockedIP = func(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() {
+		return true
+	}
+	return false
 }
 
 func main() {
@@ -76,7 +162,12 @@ func main() {
 
 		tlsConfig = cfg
 	} else {
-		cfg, err := managedTLSConfig(acmeDomain)
+		acmeEmail, err := configuredACMEEmail()
+		if err != nil {
+			log.Fatalf("invalid ACME configuration: %v", err)
+		}
+
+		cfg, err := managedTLSConfig(acmeDomain, acmeEmail)
 		if err != nil {
 			log.Fatalf("failed to manage certificate for %s: %v", acmeDomain, err)
 		}
@@ -115,7 +206,30 @@ func configuredListenAddr() string {
 	return addr
 }
 
-func managedTLSConfig(acmeDomain string) (*tls.Config, error) {
+// configuredACMEEmail returns the contact email used to register the
+// ACME account. It is required when ACME mode is enabled so Let's Encrypt
+// can deliver expiration notices and account recovery emails. The default
+// "admin@example.com" is intentionally rejected because example.com is a
+// reserved domain whose mail is undeliverable, leaving the account
+// orphaned.
+func configuredACMEEmail() (string, error) {
+	email := strings.TrimSpace(os.Getenv(acmeEmailEnv))
+	if email == "" {
+		return "", fmt.Errorf("%s must be set to a contact email when %s is configured", acmeEmailEnv, acmeDomainEnv)
+	}
+	if !strings.Contains(email, "@") {
+		return "", fmt.Errorf("%s=%q is not a valid email address", acmeEmailEnv, email)
+	}
+	lower := strings.ToLower(email)
+	if strings.HasSuffix(lower, "@example.com") ||
+		strings.HasSuffix(lower, "@example.org") ||
+		strings.HasSuffix(lower, "@example.net") {
+		return "", fmt.Errorf("%s=%q uses a reserved example domain; mail is undeliverable", acmeEmailEnv, email)
+	}
+	return email, nil
+}
+
+func managedTLSConfig(acmeDomain, acmeEmail string) (*tls.Config, error) {
 	if err := os.MkdirAll(certStoragePath, 0700); err != nil {
 		return nil, fmt.Errorf("could not create CertMagic storage directory: %w", err)
 	}
@@ -287,8 +401,13 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dstConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	dstConn, err := safeDial(r.Context(), "tcp", net.JoinHostPort(host, port), 10*time.Second)
 	if err != nil {
+		if errors.Is(err, errBlockedAddress) {
+			log.Printf("CONNECT %s blocked: %v", target, err)
+			http.Error(w, "target address is not allowed", http.StatusForbidden)
+			return
+		}
 		http.Error(w, "failed to connect to target", http.StatusBadGateway)
 		return
 	}
@@ -309,6 +428,17 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 	_ = buffered.Flush()
+
+	// Any bytes the client pipelined immediately after the CONNECT request
+	// (typically the TLS ClientHello) may already sit in the bufio.Reader.
+	// Forward them to the destination before splice-copying from the raw
+	// connection, otherwise they would be silently dropped.
+	if n := buffered.Reader.Buffered(); n > 0 {
+		if _, err := io.CopyN(dstConn, buffered.Reader, int64(n)); err != nil {
+			log.Printf("CONNECT %s: drain buffered client bytes: %v", target, err)
+			return
+		}
+	}
 
 	log.Printf("CONNECT %s", target)
 
@@ -354,6 +484,11 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := httpProxyTransport.RoundTrip(outReq)
 	if err != nil {
+		if errors.Is(err, errBlockedAddress) {
+			log.Printf("%s %s blocked: %v", r.Method, r.URL.String(), err)
+			http.Error(w, "target address is not allowed", http.StatusForbidden)
+			return
+		}
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
 		return
 	}

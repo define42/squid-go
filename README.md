@@ -15,6 +15,12 @@ and renewal. If you run the process on a non-standard local port (see
 `LISTEN_ADDR` below), port-forward external TCP/443 to that local port
 so challenge traffic still reaches the process.
 
+When `ACME_DOMAIN` is set, you must also set `ACME_EMAIL` to a real
+contact address. Let's Encrypt uses it for expiration notices and
+account recovery. The proxy refuses to start in ACME mode if
+`ACME_EMAIL` is unset or uses a reserved `example.{com,org,net}`
+domain, since those addresses are undeliverable.
+
 When `ACME_DOMAIN` is unset or empty, the proxy starts with an ephemeral
 self-signed certificate generated at startup. No domain or public reachability
 is required in this mode.
@@ -38,6 +44,16 @@ export PROXY_AUTH_SHA256="<sha256-of-user1:pass1>,<sha256-of-user2:pass2>"
 ```
 
 If `PROXY_AUTH_SHA256` is empty or unset, all proxy requests are rejected.
+
+## SSRF protection
+
+Both `CONNECT` and plain-HTTP forwarding resolve the requested target
+once and refuse to dial any address in a private, loopback, link-local,
+unspecified, or multicast range. This blocks SSRF pivoting into the
+host's internal network and cloud metadata endpoints (e.g.
+`169.254.169.254`). The resolved IP is dialed directly so DNS
+rebinding cannot redirect an already-validated hostname onto an
+internal address.
 
 ## Listen address
 
