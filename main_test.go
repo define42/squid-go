@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -177,7 +178,7 @@ func TestHandleConnect_BadTarget(t *testing.T) {
 	req.Host = "not-a-host-port"
 	rec := httptest.NewRecorder()
 
-	handleConnect(rec, req)
+	handleConnect(rec, req, map[string]struct{}{"443": {}})
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
@@ -189,7 +190,7 @@ func TestHandleConnect_RejectsNonHTTPSPort(t *testing.T) {
 	req.Host = "example.com:22"
 	rec := httptest.NewRecorder()
 
-	handleConnect(rec, req)
+	handleConnect(rec, req, map[string]struct{}{"443": {}})
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
@@ -540,6 +541,243 @@ func TestHandleConnect_DrainsBufferedClientBytes(t *testing.T) {
 		t.Fatal("destination did not receive pipelined bytes")
 	}
 }
+
+func TestIsBlockedIP_ExtraRanges(t *testing.T) {
+	tests := []struct {
+		ip   string
+		want bool
+	}{
+		{"100.64.0.1", true},          // CGNAT
+		{"100.127.255.254", true},     // CGNAT upper
+		{"192.0.0.170", true},         // IETF protocol assignments
+		{"192.0.2.5", true},           // TEST-NET-1
+		{"198.18.0.1", true},          // benchmark
+		{"198.51.100.7", true},        // TEST-NET-2
+		{"203.0.113.5", true},         // TEST-NET-3
+		{"255.255.255.255", true},     // limited broadcast
+		{"2001:db8::5", true},         // IPv6 docs
+		{"::ffff:127.0.0.1", true},    // IPv4-mapped loopback
+		{"::ffff:10.0.0.1", true},     // IPv4-mapped private
+		{"::ffff:169.254.169.254", true},
+		{"100.63.255.254", false}, // just below CGNAT
+		{"100.128.0.1", false},    // just above CGNAT
+	}
+	for _, tc := range tests {
+		t.Run(tc.ip, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("invalid test IP %q", tc.ip)
+			}
+			if got := isBlockedIP(ip); got != tc.want {
+				t.Fatalf("isBlockedIP(%s) = %v, want %v", tc.ip, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHandleConnect_AllowedPortsConfigurable(t *testing.T) {
+	req := httptest.NewRequest(http.MethodConnect, "http://example.com", nil)
+	req.Host = "example.com:8443"
+	rec := httptest.NewRecorder()
+
+	handleConnect(rec, req, map[string]struct{}{"8443": {}})
+
+	// Should pass the port check and then fail later (DNS or SSRF), not 403 here.
+	if rec.Code == http.StatusForbidden && strings.Contains(rec.Body.String(), "this port is not allowed") {
+		t.Fatalf("port 8443 should be allowed but was rejected: %s", rec.Body.String())
+	}
+}
+
+func TestHandleConnect_RejectsZoneIDHost(t *testing.T) {
+	req := httptest.NewRequest(http.MethodConnect, "http://example.com", nil)
+	req.Host = "fe80::1%eth0:443"
+	rec := httptest.NewRecorder()
+
+	handleConnect(rec, req, map[string]struct{}{"443": {}})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestConfiguredConnectPorts(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		t.Setenv(connectPortsEnv, "")
+		got, err := configuredConnectPorts()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := got["443"]; !ok || len(got) != 1 {
+			t.Fatalf("default ports = %v, want {443}", got)
+		}
+	})
+
+	t.Run("multiple", func(t *testing.T) {
+		t.Setenv(connectPortsEnv, " 443 ,8443, 9443 ")
+		got, err := configuredConnectPorts()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, p := range []string{"443", "8443", "9443"} {
+			if _, ok := got[p]; !ok {
+				t.Fatalf("missing port %s in %v", p, got)
+			}
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		t.Setenv(connectPortsEnv, "abc")
+		if _, err := configuredConnectPorts(); err == nil {
+			t.Fatal("expected error for non-numeric port")
+		}
+	})
+
+	t.Run("out of range", func(t *testing.T) {
+		t.Setenv(connectPortsEnv, "70000")
+		if _, err := configuredConnectPorts(); err == nil {
+			t.Fatal("expected error for out-of-range port")
+		}
+	})
+
+	t.Run("zero", func(t *testing.T) {
+		t.Setenv(connectPortsEnv, "0")
+		if _, err := configuredConnectPorts(); err == nil {
+			t.Fatal("expected error for port 0")
+		}
+	})
+}
+
+func TestConfiguredCertStoragePath(t *testing.T) {
+	t.Run("default is absolute", func(t *testing.T) {
+		t.Setenv(certStoragePathEnv, "")
+		got, err := configuredCertStoragePath()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !filepath.IsAbs(got) {
+			t.Fatalf("path %q is not absolute", got)
+		}
+	})
+
+	t.Run("custom path is absolute", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv(certStoragePathEnv, dir)
+		got, err := configuredCertStoragePath()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != dir {
+			t.Fatalf("got %q, want %q", got, dir)
+		}
+	})
+}
+
+// TestHandleConnect_WaitsForBothDirections verifies the proxy waits for
+// both copy goroutines before closing connections, so bytes flowing in
+// the not-yet-errored direction are not truncated.
+func TestHandleConnect_WaitsForBothDirections(t *testing.T) {
+	// Destination accepts the connection, reads until the client EOFs,
+	// then sends a final payload back. If handleConnect returns after
+	// only one direction completes, the destination's outbound payload
+	// would be truncated.
+	dstLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dst: %v", err)
+	}
+	defer dstLn.Close()
+
+	const payload = "FROM-DESTINATION"
+
+	go func() {
+		c, err := dstLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// Read any pipelined bytes from the client, then send the payload.
+		_, _ = io.Copy(io.Discard, &readUntilEOF{c})
+		_, _ = c.Write([]byte(payload))
+	}()
+
+	// Custom handler that mirrors handleConnect but dials the loopback
+	// destination directly, bypassing the SSRF filter for this test.
+	dstAddr := dstLn.Addr().String()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dst, err := net.Dial("tcp", dstAddr)
+		if err != nil {
+			t.Errorf("dial dst: %v", err)
+			return
+		}
+		defer dst.Close()
+
+		hj, _ := w.(http.Hijacker)
+		cc, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer cc.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		_ = buf.Flush()
+
+		errCh := make(chan error, 2)
+		go func() { errCh <- proxyCopy(dst, cc) }()
+		go func() { errCh <- proxyCopy(cc, dst) }()
+		<-errCh
+		<-errCh
+	})
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	defer proxyLn.Close()
+	srv := &http.Server{Handler: handler}
+	go srv.Serve(proxyLn)
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", proxyLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")); err != nil {
+		t.Fatalf("write connect: %v", err)
+	}
+
+	// Read 200 response.
+	respBuf := make([]byte, 128)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Read(respBuf); err != nil {
+		t.Fatalf("read 200: %v", err)
+	}
+
+	// Half-close the client->dst direction so destination unblocks
+	// from Read and emits its payload.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+
+	// Read the destination payload back through the tunnel. If
+	// handleConnect did not wait for the dst->client direction, this
+	// would race against the deferred clientConn.Close() and could be
+	// short-read or zero.
+	got := make([]byte, len(payload))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("got %q, want %q", got, payload)
+	}
+}
+
+// readUntilEOF wraps a Reader so io.Copy can consume to EOF without
+// caring about partial reads — used only by the test above.
+type readUntilEOF struct{ r io.Reader }
+
+func (r *readUntilEOF) Read(p []byte) (int, error) { return r.r.Read(p) }
 
 func TestListenerHostPort(t *testing.T) {
 	tests := []struct {
