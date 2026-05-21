@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Local build output
+/squid-go
+/dist/
+
 # Test binary, built with `go test -c`
 *.test
 
