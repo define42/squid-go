@@ -45,7 +45,7 @@ func basicAuthHeader(user, pass string) string {
 // CONNECT to port 443 only, mirroring the historical default used by
 // the tests below.
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), nil).ServeHTTP(w, r)
+	newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), nil, "").ServeHTTP(w, r)
 }
 
 func TestAuthorized(t *testing.T) {
@@ -232,7 +232,7 @@ func TestProxyHandler_NoAuthCIDRBypass(t *testing.T) {
 		t.Fatalf("ParseCIDR: %v", err)
 	}
 
-	h := newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), []*net.IPNet{exempt})
+	h := newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), []*net.IPNet{exempt}, "")
 
 	t.Run("exempt client bypasses auth", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
@@ -253,6 +253,135 @@ func TestProxyHandler_NoAuthCIDRBypass(t *testing.T) {
 			t.Fatalf("non-exempt client status = %d, want 407", rec.Code)
 		}
 	})
+}
+
+func TestPACProxyEndpoint(t *testing.T) {
+	tests := []struct {
+		name        string
+		acmeDomains []string
+		listenAddr  string
+		want        string
+	}{
+		{"no domains", nil, ":443", ""},
+		{"dns name default port", []string{"proxy.example.com"}, ":443", "proxy.example.com:443"},
+		{"dns name custom port", []string{"proxy.example.com"}, ":8443", "proxy.example.com:8443"},
+		{"ipv4 literal", []string{"203.0.113.5"}, ":443", "203.0.113.5:443"},
+		{"ipv6 literal bracketed", []string{"2001:db8::1"}, ":8443", "[2001:db8::1]:8443"},
+		{"listen addr with host", []string{"proxy.example.com"}, "0.0.0.0:8443", "proxy.example.com:8443"},
+		{"empty port falls back to 443", []string{"proxy.example.com"}, "", "proxy.example.com:443"},
+		{"multiple domains uses first", []string{"a.example.com", "b.example.com"}, ":443", "a.example.com:443"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pacProxyEndpoint(tc.acmeDomains, tc.listenAddr)
+			if got != tc.want {
+				t.Fatalf("pacProxyEndpoint(%v, %q) = %q, want %q", tc.acmeDomains, tc.listenAddr, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServePAC_FromConfiguredEndpoint(t *testing.T) {
+	h := newProxyHandler(map[string]struct{}{"443": {}}, nil, nil, "proxy.example.com:443")
+
+	req := httptest.NewRequest(http.MethodGet, "/proxy.pac", nil)
+	req.RemoteAddr = "192.0.2.1:54321"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/x-ns-proxy-autoconfig" {
+		t.Fatalf("Content-Type = %q, want application/x-ns-proxy-autoconfig", got)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "function FindProxyForURL(url, host)") {
+		t.Fatalf("body missing FindProxyForURL: %q", body)
+	}
+	if !strings.Contains(body, `return "HTTPS proxy.example.com:443";`) {
+		t.Fatalf("body missing HTTPS directive: %q", body)
+	}
+}
+
+func TestServePAC_BypassesProxyAuth(t *testing.T) {
+	setAuthEnv(t, sha256Hex(testProxyUser, testProxyPass))
+	h := newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), nil, "proxy.example.com:443")
+
+	req := httptest.NewRequest(http.MethodGet, "/proxy.pac", nil)
+	req.RemoteAddr = "192.0.2.1:54321"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PAC fetch returned status %d, want 200 (must bypass proxy auth)", rec.Code)
+	}
+}
+
+func TestServePAC_FallsBackToRequestHost(t *testing.T) {
+	h := newProxyHandler(map[string]struct{}{"443": {}}, nil, nil, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/proxy.pac", nil)
+	req.Host = "proxy.local:8443"
+	req.RemoteAddr = "192.0.2.1:54321"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `return "HTTPS proxy.local:8443";`) {
+		t.Fatalf("body missing host-header fallback: %q", rec.Body.String())
+	}
+}
+
+func TestServePAC_NoEndpointAndNoHost(t *testing.T) {
+	rec := httptest.NewRecorder()
+	servePAC(rec, "", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+}
+
+func TestServePAC_RejectsInjectionInHost(t *testing.T) {
+	rec := httptest.NewRecorder()
+	servePAC(rec, "", "evil\"; alert(1); //")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for malformed host", rec.Code)
+	}
+}
+
+func TestPACEndpoint_RejectsAbsoluteFormRequest(t *testing.T) {
+	// Absolute-form requests target a different origin via the proxy
+	// and must not be served the PAC; they go through the normal
+	// proxy auth + forwarding path.
+	setAuthEnv(t, sha256Hex(testProxyUser, testProxyPass))
+	h := newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), nil, "proxy.example.com:443")
+
+	req := httptest.NewRequest(http.MethodGet, "http://other.example.com/proxy.pac", nil)
+	req.RemoteAddr = "192.0.2.1:54321"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusProxyAuthRequired {
+		t.Fatalf("absolute-form /proxy.pac status = %d, want 407 (must go through proxy auth)", rec.Code)
+	}
+}
+
+func TestPACEndpoint_RejectsNonGET(t *testing.T) {
+	setAuthEnv(t, sha256Hex(testProxyUser, testProxyPass))
+	h := newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), nil, "proxy.example.com:443")
+
+	req := httptest.NewRequest(http.MethodPost, "/proxy.pac", nil)
+	req.RemoteAddr = "192.0.2.1:54321"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// Non-GET must not be treated as a PAC fetch; it falls through to
+	// normal proxy handling and is challenged for auth.
+	if rec.Code != http.StatusProxyAuthRequired {
+		t.Fatalf("POST /proxy.pac status = %d, want 407", rec.Code)
+	}
 }
 
 func TestHandlePlainHTTP_RejectsNonAbsoluteURL(t *testing.T) {

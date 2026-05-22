@@ -90,6 +90,13 @@ const (
 	// or empty, no client is exempted and the normal PROXY_AUTH_SHA256
 	// check applies to every request.
 	noAuthCIDRsEnv = "NO_AUTH_CIDRS"
+
+	// proxyPACPath is the HTTP path that serves a Proxy Auto-Config
+	// (PAC) file directing clients to use this proxy over HTTPS. The
+	// PAC file is fetched directly from the proxy host (not via the
+	// proxy protocol itself) and so is served unauthenticated on
+	// origin-form GET requests only.
+	proxyPACPath = "/proxy.pac"
 )
 
 var httpProxyTransport = &http.Transport{
@@ -283,7 +290,7 @@ func run() error {
 		)
 	}
 
-	handler := newProxyHandler(allowedPorts, allowedAuthHashes(), noAuthNets)
+	handler := newProxyHandler(allowedPorts, allowedAuthHashes(), noAuthNets, pacProxyEndpoint(acmeDomains, listenAddr))
 
 	if len(noAuthNets) > 0 {
 		nets := make([]string, 0, len(noAuthNets))
@@ -592,9 +599,21 @@ func listenerHostPort(host, addr string) string {
 // per-request authentication does not re-read or re-parse the env.
 // noAuthNets is an optional list of client IP networks whose requests
 // bypass the Proxy-Authorization check entirely (e.g. trusted internal
-// subnets).
-func newProxyHandler(allowedPorts map[string]struct{}, allowedHashes []string, noAuthNets []*net.IPNet) http.Handler {
+// subnets). pacEndpoint is the host:port string embedded in the PAC
+// file served at /proxy.pac; when empty, the request's Host header is
+// used as a best-effort fallback.
+func newProxyHandler(allowedPorts map[string]struct{}, allowedHashes []string, noAuthNets []*net.IPNet, pacEndpoint string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Serve the PAC file on origin-form GET requests (i.e. direct
+		// HTTPS requests to the proxy host, not requests forwarded via
+		// the HTTP proxy protocol). PAC discovery happens before the
+		// client knows to authenticate, so this endpoint is exempt
+		// from Proxy-Authorization.
+		if r.Method == http.MethodGet && r.URL.Scheme == "" && r.URL.Host == "" && r.URL.Path == proxyPACPath {
+			servePAC(w, pacEndpoint, r.Host)
+			return
+		}
+
 		if !clientIPExempt(r, noAuthNets) && !authorized(r, allowedHashes) {
 			w.Header().Set("Proxy-Authenticate", `Basic realm="go-https-proxy"`)
 			http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
@@ -608,6 +627,76 @@ func newProxyHandler(allowedPorts map[string]struct{}, allowedHashes []string, n
 			handlePlainHTTP(w, r)
 		}
 	})
+}
+
+// pacProxyEndpoint returns the host:port string that PAC clients should
+// dial to reach this proxy. When acmeDomains has entries, the first
+// entry (the canonical name on the certificate) is used together with
+// the port from listenAddr. Returns "" when no ACME domain is
+// configured, in which case servePAC falls back to the inbound request
+// Host header at serve time.
+func pacProxyEndpoint(acmeDomains []string, listenAddr string) string {
+	if len(acmeDomains) == 0 {
+		return ""
+	}
+	port := listenAddrPort(listenAddr)
+	host := acmeDomains[0]
+	// Bracket IPv6 literals so the PAC "HTTPS host:port" directive
+	// parses correctly.
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		host = "[" + host + "]"
+	}
+	if port == "" {
+		port = "443"
+	}
+	return host + ":" + port
+}
+
+// listenAddrPort extracts the port component from a listen address such
+// as ":443", "0.0.0.0:8443", or "[::]:8443". Returns "" when no port
+// can be determined.
+func listenAddrPort(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	if strings.HasPrefix(addr, ":") {
+		return strings.TrimPrefix(addr, ":")
+	}
+	if _, port, err := net.SplitHostPort(addr); err == nil {
+		return port
+	}
+	return ""
+}
+
+// servePAC writes a minimal Proxy Auto-Config file directing the client
+// to use this proxy over HTTPS. endpoint is the canonical host:port
+// computed from configuration; when it is empty, reqHost (the inbound
+// request's Host header) is used as a best-effort fallback so the
+// endpoint still works in self-signed mode where no public hostname is
+// configured.
+func servePAC(w http.ResponseWriter, endpoint, reqHost string) {
+	hostPort := endpoint
+	if hostPort == "" {
+		hostPort = strings.TrimSpace(reqHost)
+	}
+	if hostPort == "" {
+		http.Error(w, "proxy endpoint not configured", http.StatusServiceUnavailable)
+		return
+	}
+	// Defensive escaping for the JavaScript string literal. A valid
+	// host:port contains none of these characters; this guards against
+	// any unexpected upstream value (e.g. a malformed Host header).
+	if strings.ContainsAny(hostPort, "\"\\\r\n") {
+		http.Error(w, "proxy endpoint not configured", http.StatusServiceUnavailable)
+		return
+	}
+	body := "function FindProxyForURL(url, host) {\n" +
+		"    return \"HTTPS " + hostPort + "\";\n" +
+		"}\n"
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = io.WriteString(w, body)
 }
 
 func authorized(r *http.Request, allowed []string) bool {
