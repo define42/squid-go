@@ -66,6 +66,21 @@ const (
 	// permits as CONNECT targets. Defaults to "443" (HTTPS only).
 	connectPortsEnv     = "CONNECT_ALLOWED_PORTS"
 	connectPortsDefault = "443"
+
+	// acmeProfileEnv optionally selects a Let's Encrypt ACME profile to
+	// request when ordering certificates. Let's Encrypt's "default" profile
+	// refuses IP-address identifiers; the "shortlived" profile (≤ 6-day
+	// validity) is required to obtain an IP certificate. When unset, the
+	// proxy auto-selects "shortlived" if any entry in ACME_DOMAIN is an IP
+	// literal, and leaves the profile unset otherwise. Setting this env to
+	// an empty value via "ACME_PROFILE=" still triggers the auto-default;
+	// pass an explicit name (e.g. "classic", "tlsserver") to override.
+	// See https://letsencrypt.org/docs/profiles/ for the current list.
+	acmeProfileEnv = "ACME_PROFILE"
+
+	// acmeProfileShortLived is the Let's Encrypt profile name that permits
+	// IP-address identifiers (issuing ~6-day certificates).
+	acmeProfileShortLived = "shortlived"
 )
 
 var httpProxyTransport = &http.Transport{
@@ -250,6 +265,7 @@ func run() error {
 		slog.Info("HTTPS proxy listening",
 			"url", "https://"+listenerHostPort(acmeDomains[0], listenAddr),
 			"domains", acmeDomains,
+			"acme_profile", configuredACMEProfile(acmeDomains),
 		)
 	}
 
@@ -326,6 +342,27 @@ func configuredACMEDomains() []string {
 		return nil
 	}
 	return out
+}
+
+// configuredACMEProfile returns the ACME profile name to request when
+// ordering certificates. If ACME_PROFILE is set to a non-empty trimmed
+// value, it is returned verbatim. Otherwise, if any entry in
+// acmeDomains parses as an IP address literal, "shortlived" is returned
+// (Let's Encrypt's default profile rejects IP identifiers, while the
+// shortlived profile accepts them). Returns "" when no profile should
+// be sent on the order.
+func configuredACMEProfile(acmeDomains []string) string {
+	if v, ok := os.LookupEnv(acmeProfileEnv); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	for _, d := range acmeDomains {
+		if net.ParseIP(d) != nil {
+			return acmeProfileShortLived
+		}
+	}
+	return ""
 }
 
 // configuredListenAddr returns the TCP address the proxy should bind to.
@@ -443,6 +480,7 @@ func managedTLSConfig(acmeDomains []string, acmeEmail string) (*tls.Config, erro
 	certmagic.DefaultACME.Email = acmeEmail
 	certmagic.DefaultACME.Agreed = true
 	certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
+	certmagic.DefaultACME.Profile = configuredACMEProfile(acmeDomains)
 
 	magic := certmagic.NewDefault()
 

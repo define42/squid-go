@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -332,6 +333,72 @@ func TestConfiguredACMEDomains(t *testing.T) {
 		got := configuredACMEDomains()
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("configuredACMEDomains() = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestConfiguredACMEProfile(t *testing.T) {
+	t.Run("returns empty for DNS-only identifiers when unset", func(t *testing.T) {
+		unsetEnvForTest(t, acmeProfileEnv)
+		if got := configuredACMEProfile([]string{"proxy.example.com"}); got != "" {
+			t.Fatalf("configuredACMEProfile() = %q, want \"\"", got)
+		}
+	})
+
+	t.Run("auto-selects shortlived for IPv4 identifier", func(t *testing.T) {
+		unsetEnvForTest(t, acmeProfileEnv)
+		if got := configuredACMEProfile([]string{"203.0.113.8"}); got != acmeProfileShortLived {
+			t.Fatalf("configuredACMEProfile() = %q, want %q", got, acmeProfileShortLived)
+		}
+	})
+
+	t.Run("auto-selects shortlived for IPv6 identifier", func(t *testing.T) {
+		unsetEnvForTest(t, acmeProfileEnv)
+		if got := configuredACMEProfile([]string{"2001:db8::1"}); got != acmeProfileShortLived {
+			t.Fatalf("configuredACMEProfile() = %q, want %q", got, acmeProfileShortLived)
+		}
+	})
+
+	t.Run("auto-selects shortlived when any identifier is an IP", func(t *testing.T) {
+		unsetEnvForTest(t, acmeProfileEnv)
+		got := configuredACMEProfile([]string{"proxy.example.com", "203.0.113.8"})
+		if got != acmeProfileShortLived {
+			t.Fatalf("configuredACMEProfile() = %q, want %q", got, acmeProfileShortLived)
+		}
+	})
+
+	t.Run("env override wins over auto-default", func(t *testing.T) {
+		t.Setenv(acmeProfileEnv, "classic")
+		if got := configuredACMEProfile([]string{"203.0.113.8"}); got != "classic" {
+			t.Fatalf("configuredACMEProfile() = %q, want %q", got, "classic")
+		}
+	})
+
+	t.Run("whitespace-only env falls back to auto-default", func(t *testing.T) {
+		t.Setenv(acmeProfileEnv, "   ")
+		if got := configuredACMEProfile([]string{"203.0.113.8"}); got != acmeProfileShortLived {
+			t.Fatalf("configuredACMEProfile() = %q, want %q", got, acmeProfileShortLived)
+		}
+		if got := configuredACMEProfile([]string{"proxy.example.com"}); got != "" {
+			t.Fatalf("configuredACMEProfile() = %q, want \"\"", got)
+		}
+	})
+}
+
+// unsetEnvForTest unsets an environment variable for the remainder of
+// the current test, restoring its prior state when the test ends. This
+// complements testing.T.Setenv, which only supports setting values.
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	prev, had := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unsetenv %s: %v", key, err)
+	}
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv(key, prev)
+		} else {
+			_ = os.Unsetenv(key)
 		}
 	})
 }

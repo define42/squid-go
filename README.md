@@ -91,6 +91,7 @@ All configuration is via environment variables.
 | `LISTEN_ADDR` | `:443` | Local TCP address to bind. |
 | `ACME_DOMAIN` | *(unset)* | Comma-separated DNS names / IP literals to obtain a Let's Encrypt cert for. Unset = self-signed. |
 | `ACME_EMAIL` | *(unset, required when `ACME_DOMAIN` is set)* | Contact address for Let's Encrypt account. |
+| `ACME_PROFILE` | *(auto: `shortlived` if any `ACME_DOMAIN` entry is an IP literal, else unset)* | Optional Let's Encrypt [ACME profile](https://letsencrypt.org/docs/profiles/) to request. IP-address identifiers require `shortlived` (~6-day certs); LE's default profile rejects them. |
 | `CERT_STORAGE_PATH` | `./certmagic-storage` (image: `/var/lib/squid-go`) | Directory for ACME account key + issued certs. Created `0700`. |
 | `CONNECT_ALLOWED_PORTS` | `443` | Comma-separated allow-list of TCP ports for `CONNECT` tunnels. |
 
@@ -117,6 +118,18 @@ All configuration is via environment variables.
   `ACME_EMAIL` is required in this mode and is rejected if it uses a
   reserved `example.{com,org,net}` domain, since those addresses are
   undeliverable.
+
+  **IP-address certificates.** Let's Encrypt's default ACME profile
+  refuses IP-address identifiers. When any `ACME_DOMAIN` entry parses as
+  an IP literal, `squid-go` automatically requests the `shortlived`
+  profile (≤ 6-day certificates), which is currently the only LE profile
+  that issues IP certs. The account submitting the order must be
+  allow-listed by Let's Encrypt for IP issuance; otherwise the order is
+  still rejected. Renewal happens automatically while the process is
+  running and TCP/443 stays reachable. Set `ACME_PROFILE` to override
+  the auto-selection (e.g. `ACME_PROFILE=classic` for a DNS-only setup
+  that wants long-lived certificates explicitly). See
+  <https://letsencrypt.org/docs/profiles/> for the current profile list.
 
 - **`ACME_DOMAIN` unset or empty** — the proxy generates a fresh
   self-signed certificate at startup. No domain or public reachability
