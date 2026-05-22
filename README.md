@@ -38,7 +38,7 @@ to run unattended behind a network boundary you already trust.
 
 ```sh
 # 1. Generate a digest for each user:password pair
-printf '%s' 'alice:s3cret' | sha256sum
+printf '%s' 'alice:s3cret' | sha256sum | awk '{print $1}'
 
 # 2. Start the proxy (self-signed TLS, no public reachability required)
 export PROXY_AUTH_SHA256="<digest-from-step-1>"
@@ -139,7 +139,7 @@ hex digests. Each digest authorises one `user:password` pair for HTTP
 Basic proxy authentication.
 
 ```sh
-printf '%s' 'user:pass' | sha256sum
+printf '%s' 'user:pass' | sha256sum | awk '{print $1}'
 export PROXY_AUTH_SHA256="<digest1>,<digest2>"
 ```
 

@@ -40,6 +40,13 @@ func basicAuthHeader(user, pass string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
 }
 
+// proxyHandler is a test helper that constructs a handler permitting
+// CONNECT to port 443 only, mirroring the historical default used by
+// the tests below.
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes()).ServeHTTP(w, r)
+}
+
 func TestAuthorized(t *testing.T) {
 	setAuthEnv(t,
 		sha256Hex(testProxyUser, testProxyPass),
@@ -67,7 +74,7 @@ func TestAuthorized(t *testing.T) {
 			if tc.header != "" {
 				req.Header.Set("Proxy-Authorization", tc.header)
 			}
-			if got := authorized(req); got != tc.want {
+			if got := authorized(req, allowedAuthHashes()); got != tc.want {
 				t.Fatalf("authorized() = %v, want %v", got, tc.want)
 			}
 		})
@@ -80,7 +87,7 @@ func TestAuthorized_NoConfiguredHashes(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
 	req.Header.Set("Proxy-Authorization", basicAuthHeader(testProxyUser, testProxyPass))
 
-	if authorized(req) {
+	if authorized(req, allowedAuthHashes()) {
 		t.Fatal("authorized() = true when no hashes are configured, want false")
 	}
 }
@@ -872,7 +879,7 @@ req.Header.Set("Proxy-Authorization", header)
 }
 
 // Must not panic regardless of input.
-got := authorized(req)
+got := authorized(req, allowedAuthHashes())
 if !got {
 return
 }

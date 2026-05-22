@@ -253,7 +253,7 @@ func run() error {
 		)
 	}
 
-	handler := newProxyHandler(allowedPorts)
+	handler := newProxyHandler(allowedPorts, allowedAuthHashes())
 
 	server := &http.Server{
 		Addr:              listenAddr,
@@ -455,13 +455,22 @@ func managedTLSConfig(acmeDomains []string, acmeEmail string) (*tls.Config, erro
 		"http/1.1",
 		"acme-tls/1",
 	}
+	// Defense-in-depth: pin a minimum TLS version even though Go's
+	// current default is TLS 1.2. Keeps the contract explicit and
+	// future-proof against default changes.
+	if cfg.MinVersion < tls.VersionTLS12 {
+		cfg.MinVersion = tls.VersionTLS12
+	}
 
 	return cfg, nil
 }
 
 // selfSignedTLSConfig generates an ephemeral ECDSA P-256 key and a
-// self-signed certificate valid for 10 years. Use this when no ACME_DOMAIN
-// is configured and domain-based certificate management is not needed.
+// self-signed certificate valid for 90 days. The short lifetime limits
+// blast radius if the in-memory key is ever exfiltrated; the process is
+// expected to be restarted (and a fresh cert regenerated) more often
+// than that. Use this when no ACME_DOMAIN is configured and domain-based
+// certificate management is not needed.
 func selfSignedTLSConfig() (*tls.Config, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -478,7 +487,7 @@ func selfSignedTLSConfig() (*tls.Config, error) {
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "squid-go"},
 		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(10 * 365 * 24 * time.Hour),
+		NotAfter:     now.Add(90 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
@@ -496,6 +505,7 @@ func selfSignedTLSConfig() (*tls.Config, error) {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"http/1.1"},
+		MinVersion:   tls.VersionTLS12,
 	}, nil
 }
 
@@ -510,10 +520,13 @@ func listenerHostPort(host, addr string) string {
 // newProxyHandler returns an http.Handler that authenticates inbound
 // requests and dispatches CONNECT vs plain-HTTP traffic. allowedPorts
 // is the set of TCP ports the proxy is willing to tunnel via CONNECT;
-// all other ports are rejected with 403 Forbidden.
-func newProxyHandler(allowedPorts map[string]struct{}) http.Handler {
+// all other ports are rejected with 403 Forbidden. allowedHashes is the
+// pre-parsed list of sha256(user:password) hex digests that authorise
+// inbound requests; it is captured once at handler construction so
+// per-request authentication does not re-read or re-parse the env.
+func newProxyHandler(allowedPorts map[string]struct{}, allowedHashes []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r) {
+		if !authorized(r, allowedHashes) {
 			w.Header().Set("Proxy-Authenticate", `Basic realm="go-https-proxy"`)
 			http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 			return
@@ -528,13 +541,7 @@ func newProxyHandler(allowedPorts map[string]struct{}) http.Handler {
 	})
 }
 
-// proxyHandler is the package-default handler used by tests. It permits
-// CONNECT to port 443 only, mirroring the historical behavior.
-func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	newProxyHandler(map[string]struct{}{"443": {}}).ServeHTTP(w, r)
-}
-
-func authorized(r *http.Request) bool {
+func authorized(r *http.Request, allowed []string) bool {
 	auth := r.Header.Get("Proxy-Authorization")
 	if auth == "" {
 		return false
@@ -561,7 +568,6 @@ func authorized(r *http.Request) bool {
 	got := make([]byte, hex.EncodedLen(len(sum)))
 	hex.Encode(got, sum[:])
 
-	allowed := allowedAuthHashes()
 	if len(allowed) == 0 {
 		return false
 	}
@@ -711,7 +717,7 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := httpProxyTransport.RoundTrip(outReq)
 	if err != nil {
 		if errors.Is(err, errBlockedAddress) {
-			slog.Warn("HTTP request blocked", "method", r.Method, "url", r.URL.String(), "err", err)
+			slog.Warn("HTTP request blocked", "method", r.Method, "host", r.URL.Host, "path", r.URL.Path, "err", err)
 			http.Error(w, "target address is not allowed", http.StatusForbidden)
 			return
 		}
@@ -726,11 +732,11 @@ func handlePlainHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		slog.Warn("response body copy failed", "method", r.Method, "url", r.URL.String(), "status", resp.StatusCode, "err", err)
+		slog.Warn("response body copy failed", "method", r.Method, "host", r.URL.Host, "path", r.URL.Path, "status", resp.StatusCode, "err", err)
 		return
 	}
 
-	slog.Info("HTTP proxy request", "method", r.Method, "url", r.URL.String(), "status", resp.StatusCode)
+	slog.Info("HTTP proxy request", "method", r.Method, "host", r.URL.Host, "path", r.URL.Path, "status", resp.StatusCode)
 }
 
 // proxyCopy splices data from src to dst. When src reports EOF, it
