@@ -8,6 +8,10 @@ services:
       ACME_DOMAIN: proxy.example.com
       ACME_EMAIL: ops@example.com
       PROXY_AUTH_SHA256: ${PROXY_AUTH_SHA256:?set PROXY_AUTH_SHA256 to a sha256(user:password) digest}
+      # Optional: comma-separated client IPs / CIDRs allowed to use the
+      # proxy without supplying credentials. Only list networks you fully
+      # trust; matching is against the raw TCP peer address.
+      # NO_AUTH_CIDRS: "10.0.0.0/24,192.0.2.7"
       CERT_STORAGE_PATH: /var/lib/squid-go
     volumes:
       - squid-go-certs:/var/lib/squid-go

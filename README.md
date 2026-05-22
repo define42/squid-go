@@ -94,6 +94,7 @@ All configuration is via environment variables.
 | `ACME_PROFILE` | *(auto: `shortlived` if any `ACME_DOMAIN` entry is an IP literal, else unset)* | Optional Let's Encrypt [ACME profile](https://letsencrypt.org/docs/profiles/) to request. IP-address identifiers require `shortlived` (~6-day certs); LE's default profile rejects them. |
 | `CERT_STORAGE_PATH` | `./certmagic-storage` (image: `/var/lib/squid-go`) | Directory for ACME account key + issued certs. Created `0700`. |
 | `CONNECT_ALLOWED_PORTS` | `443` | Comma-separated allow-list of TCP ports for `CONNECT` tunnels. |
+| `NO_AUTH_CIDRS` | *(unset)* | Comma-separated IPs / CIDRs of clients allowed to use the proxy **without** authentication. Bare IPs are treated as `/32` (IPv4) or `/128` (IPv6). |
 
 ### TLS certificates
 
@@ -159,6 +160,32 @@ export PROXY_AUTH_SHA256="<digest1>,<digest2>"
 If `PROXY_AUTH_SHA256` is empty or unset, all proxy requests are
 rejected. To rotate a credential, replace its digest in the variable and
 restart the process.
+
+#### Allow-listing client IPs without authentication
+
+`NO_AUTH_CIDRS` is an optional comma-separated list of IP addresses and
+CIDR ranges. Clients whose remote address falls inside any listed range
+are allowed to use the proxy **without supplying any
+`Proxy-Authorization` header**. This is useful for trusted internal
+networks that should reach the proxy without managing credentials.
+
+```sh
+# Trust everything from a private /24 plus a single static host
+export NO_AUTH_CIDRS="10.0.0.0/24,192.0.2.7"
+# IPv6 ranges and single addresses work too
+export NO_AUTH_CIDRS="2001:db8::/32,[2001:db8::1]"
+```
+
+Bare IP literals are treated as a single host (`/32` for IPv4, `/128`
+for IPv6). Whitespace and empty entries are ignored. When the variable
+is unset or empty, every request must authenticate via
+`PROXY_AUTH_SHA256`.
+
+> **Warning.** Only list networks you fully trust. `squid-go` matches
+> against the TCP peer address, so if you front the proxy with a load
+> balancer or other reverse proxy every request will appear to come
+> from that intermediary's IP. Do not put such an intermediary into
+> `NO_AUTH_CIDRS` unless you also enforce authentication upstream.
 
 ### CONNECT tunnels
 

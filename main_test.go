@@ -45,7 +45,7 @@ func basicAuthHeader(user, pass string) string {
 // CONNECT to port 443 only, mirroring the historical default used by
 // the tests below.
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes()).ServeHTTP(w, r)
+	newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), nil).ServeHTTP(w, r)
 }
 
 func TestAuthorized(t *testing.T) {
@@ -117,6 +117,142 @@ func TestProxyHandler_Unauthorized(t *testing.T) {
 	if got := rec.Header().Get("Proxy-Authenticate"); !strings.HasPrefix(got, "Basic ") {
 		t.Fatalf("Proxy-Authenticate = %q, want Basic challenge", got)
 	}
+}
+
+func TestConfiguredNoAuthNets(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantLen int
+		wantErr bool
+		// check is an optional sanity check on the parsed nets.
+		check func(t *testing.T, nets []*net.IPNet)
+	}{
+		{name: "unset", raw: "", wantLen: 0},
+		{name: "only whitespace", raw: "   ,  ,", wantLen: 0},
+		{
+			name:    "mixed cidrs and bare ips",
+			raw:     " 10.0.0.0/8 , 192.0.2.5, 2001:db8::/32 ,[::1]",
+			wantLen: 4,
+			check: func(t *testing.T, nets []*net.IPNet) {
+				if !nets[0].Contains(net.ParseIP("10.1.2.3")) {
+					t.Errorf("10.0.0.0/8 should contain 10.1.2.3")
+				}
+				if !nets[1].Contains(net.ParseIP("192.0.2.5")) {
+					t.Errorf("bare /32 should contain itself")
+				}
+				if nets[1].Contains(net.ParseIP("192.0.2.6")) {
+					t.Errorf("bare /32 must not contain neighbour")
+				}
+				if !nets[2].Contains(net.ParseIP("2001:db8::1")) {
+					t.Errorf("2001:db8::/32 should contain 2001:db8::1")
+				}
+				if !nets[3].Contains(net.ParseIP("::1")) {
+					t.Errorf("bare ::1 /128 should contain itself")
+				}
+			},
+		},
+		{name: "invalid ip", raw: "not-an-ip", wantErr: true},
+		{name: "invalid cidr", raw: "10.0.0.0/40", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(noAuthCIDRsEnv, tc.raw)
+			got, err := configuredNoAuthNets()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if len(got) != tc.wantLen {
+				t.Fatalf("len(nets) = %d, want %d (%v)", len(got), tc.wantLen, got)
+			}
+			if tc.check != nil {
+				tc.check(t, got)
+			}
+		})
+	}
+}
+
+func TestClientIPExempt(t *testing.T) {
+	_, ipv4Net, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	_, ipv6Net, err := net.ParseCIDR("2001:db8::/32")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	nets := []*net.IPNet{ipv4Net, ipv6Net}
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		want       bool
+	}{
+		{"ipv4 in range", "10.1.2.3:54321", true},
+		{"ipv4 out of range", "192.0.2.1:54321", false},
+		{"ipv6 in range", "[2001:db8::1]:54321", true},
+		{"ipv6 zone id stripped", "[fe80::1%eth0]:54321", false},
+		{"ipv6 out of range", "[2001:db9::1]:54321", false},
+		{"bare ip without port", "10.2.3.4", true},
+		{"malformed", "not-an-addr", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+			req.RemoteAddr = tc.remoteAddr
+			if got := clientIPExempt(req, nets); got != tc.want {
+				t.Fatalf("clientIPExempt(%q) = %v, want %v", tc.remoteAddr, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("empty list never exempts", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.RemoteAddr = "10.1.2.3:54321"
+		if clientIPExempt(req, nil) {
+			t.Fatal("clientIPExempt with nil nets should be false")
+		}
+	})
+}
+
+func TestProxyHandler_NoAuthCIDRBypass(t *testing.T) {
+	// With auth required AND no credentials supplied, a client whose
+	// IP falls inside the exempt range must still be served (returning
+	// 400 here because the test request is not a valid CONNECT/HTTP
+	// absolute-URL request; the key assertion is that we do NOT get
+	// 407 ProxyAuthRequired).
+	setAuthEnv(t, sha256Hex(testProxyUser, testProxyPass))
+	_, exempt, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+
+	h := newProxyHandler(map[string]struct{}{"443": {}}, allowedAuthHashes(), []*net.IPNet{exempt})
+
+	t.Run("exempt client bypasses auth", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.RemoteAddr = "10.1.2.3:54321"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code == http.StatusProxyAuthRequired {
+			t.Fatalf("exempt client was challenged for auth (status %d)", rec.Code)
+		}
+	})
+
+	t.Run("non-exempt client still challenged", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req.RemoteAddr = "192.0.2.1:54321"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusProxyAuthRequired {
+			t.Fatalf("non-exempt client status = %d, want 407", rec.Code)
+		}
+	})
 }
 
 func TestHandlePlainHTTP_RejectsNonAbsoluteURL(t *testing.T) {
