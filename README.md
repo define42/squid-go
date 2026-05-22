@@ -28,6 +28,12 @@ to run unattended behind a network boundary you already trust.
   hostname onto an internal address.
 - **CONNECT port allow-list** — only ports listed in
   `CONNECT_ALLOWED_PORTS` (default `443`) may be tunneled.
+- **PAC file at `/proxy.pac`** — clients can be configured with the URL
+  `https://<your-host>/proxy.pac` to auto-discover the proxy. The file
+  returns a single `HTTPS` directive pointing at the configured
+  `ACME_DOMAIN` (or the request `Host` header in self-signed mode) on
+  the proxy's listen port. The endpoint is served unauthenticated so
+  browsers can fetch it before any proxy credentials are configured.
 - **Graceful shutdown** — SIGINT / SIGTERM drain in-flight requests, with
   up to 30 seconds for active `CONNECT` tunnels to finish.
 - **Distroless container** — non-root runtime, no shell, ~10 MB image.
