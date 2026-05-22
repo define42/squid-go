@@ -483,6 +483,12 @@ func managedTLSConfig(acmeDomains []string, acmeEmail string) (*tls.Config, erro
 	certmagic.DefaultACME.Profile = configuredACMEProfile(acmeDomains)
 
 	magic := certmagic.NewDefault()
+	// Pin the default server name so cert selection works even when
+	// the client connects without SNI (common for IP-literal endpoints).
+	// Without this, CertMagic can fall back to looking up a certificate
+	// for the local connection address (e.g. a container-internal IP)
+	// and fail the handshake.
+	magic.DefaultServerName = acmeDomains[0]
 
 	if err := magic.ManageSync(context.Background(), acmeDomains); err != nil {
 		return nil, err
