@@ -100,7 +100,7 @@ All configuration is via environment variables.
 | `ACME_EMAIL` | *(unset, required when `ACME_DOMAIN` is set)* | Contact address for Let's Encrypt account. |
 | `ACME_PROFILE` | *(auto: `shortlived` if any `ACME_DOMAIN` entry is an IP literal, else unset)* | Optional Let's Encrypt [ACME profile](https://letsencrypt.org/docs/profiles/) to request. IP-address identifiers require `shortlived` (~6-day certs); LE's default profile rejects them. |
 | `CERT_STORAGE_PATH` | `./certmagic-storage` (image: `/var/lib/squid-go`) | Directory for ACME account key + issued certs. Created `0700`. |
-| `CONNECT_ALLOWED_PORTS` | `443` | Comma-separated allow-list of TCP ports for `CONNECT` tunnels. |
+| `CONNECT_ALLOWED_PORTS` | `443` | Comma-separated allow-list of TCP ports for `CONNECT` tunnels, or `all` to permit any port. |
 | `NO_AUTH_CIDRS` | *(unset)* | Comma-separated IPs / CIDRs of clients allowed to use the proxy **without** authentication. Bare IPs are treated as `/32` (IPv4) or `/128` (IPv6). |
 
 ### TLS certificates
@@ -205,6 +205,13 @@ export CONNECT_ALLOWED_PORTS="443,8443"
 ```
 
 `CONNECT` requests to any other port are rejected with HTTP 403.
+
+Set it to `all` (case-insensitive) to disable the allow-list and permit
+`CONNECT` to any port:
+
+```sh
+export CONNECT_ALLOWED_PORTS="all"
+```
 
 ### Listen address
 

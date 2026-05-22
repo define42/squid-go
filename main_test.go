@@ -1040,6 +1040,31 @@ func TestConfiguredConnectPorts(t *testing.T) {
 			t.Fatal("expected error for port 0")
 		}
 	})
+
+	t.Run("all", func(t *testing.T) {
+		t.Setenv(connectPortsEnv, " ALL ")
+		got, err := configuredConnectPorts()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := got[connectPortsAll]; !ok || len(got) != 1 {
+			t.Fatalf("ports = %v, want all-ports sentinel", got)
+		}
+	})
+}
+
+func TestHandleConnect_AllowedPortsAll(t *testing.T) {
+	req := httptest.NewRequest(http.MethodConnect, "http://example.com", nil)
+	req.Host = "example.com:12345"
+	rec := httptest.NewRecorder()
+
+	handleConnect(rec, req, map[string]struct{}{connectPortsAll: {}})
+
+	// With the all-ports sentinel the port check must pass; failure can only
+	// come later (DNS or SSRF), never a "port not allowed" 403 here.
+	if rec.Code == http.StatusForbidden && strings.Contains(rec.Body.String(), "this port is not allowed") {
+		t.Fatalf("port 12345 should be allowed but was rejected: %s", rec.Body.String())
+	}
 }
 
 func TestConfiguredCertStoragePath(t *testing.T) {

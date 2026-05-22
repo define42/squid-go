@@ -72,9 +72,15 @@ const (
 	certStoragePathDefault = "./certmagic-storage"
 
 	// connectPortsEnv is a comma-separated allow-list of TCP ports the proxy
-	// permits as CONNECT targets. Defaults to "443" (HTTPS only).
+	// permits as CONNECT targets. Defaults to "443" (HTTPS only). The special
+	// value "all" disables the allow-list and permits CONNECT to any port.
 	connectPortsEnv     = "CONNECT_ALLOWED_PORTS"
 	connectPortsDefault = "443"
+	// connectPortsAll is the case-insensitive CONNECT_ALLOWED_PORTS value that
+	// permits CONNECT to every TCP port. It doubles as the sentinel key stored
+	// in the allow-list map; real entries are always decimal port numbers, so
+	// it can never collide with a configured port.
+	connectPortsAll = "all"
 
 	// acmeProfileEnv optionally selects a Let's Encrypt ACME profile to
 	// request when ordering certificates. Let's Encrypt's "default" profile
@@ -489,11 +495,16 @@ func configuredCertStoragePath() (string, error) {
 // configuredConnectPorts returns the set of TCP ports the proxy is willing
 // to tunnel via CONNECT. The CONNECT_ALLOWED_PORTS env var contains a
 // comma-separated list; whitespace and empty entries are ignored. Each
-// entry must be a decimal integer in the valid TCP range.
+// entry must be a decimal integer in the valid TCP range. The special
+// value "all" (case-insensitive) returns the all-ports sentinel, allowing
+// CONNECT to any port.
 func configuredConnectPorts() (map[string]struct{}, error) {
 	raw := strings.TrimSpace(os.Getenv(connectPortsEnv))
 	if raw == "" {
 		raw = connectPortsDefault
+	}
+	if strings.EqualFold(raw, connectPortsAll) {
+		return map[string]struct{}{connectPortsAll: {}}, nil
 	}
 	out := make(map[string]struct{})
 	for _, p := range strings.Split(raw, ",") {
@@ -903,6 +914,17 @@ func clientIPExempt(r *http.Request, nets []*net.IPNet) bool {
 	return false
 }
 
+// connectPortAllowed reports whether the proxy may open a CONNECT tunnel to
+// the given port. When the allow-list holds the "all" sentinel (set via
+// CONNECT_ALLOWED_PORTS=all) every port is permitted.
+func connectPortAllowed(allowedPorts map[string]struct{}, port string) bool {
+	if _, all := allowedPorts[connectPortsAll]; all {
+		return true
+	}
+	_, ok := allowedPorts[port]
+	return ok
+}
+
 func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[string]struct{}) {
 	target := r.Host
 
@@ -920,7 +942,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[stri
 		return
 	}
 
-	if _, ok := allowedPorts[port]; !ok {
+	if !connectPortAllowed(allowedPorts, port) {
 		http.Error(w, "CONNECT to this port is not allowed", http.StatusForbidden)
 		return
 	}
