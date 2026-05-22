@@ -81,6 +81,15 @@ const (
 	// acmeProfileShortLived is the Let's Encrypt profile name that permits
 	// IP-address identifiers (issuing ~6-day certificates).
 	acmeProfileShortLived = "shortlived"
+
+	// noAuthCIDRsEnv is a comma-separated list of IP addresses and CIDR
+	// ranges whose clients are allowed to use the proxy without supplying
+	// a Proxy-Authorization header. Bare IPv4/IPv6 literals (e.g.
+	// "192.0.2.1" or "2001:db8::1") are treated as /32 and /128
+	// respectively. Whitespace and empty entries are ignored. When unset
+	// or empty, no client is exempted and the normal PROXY_AUTH_SHA256
+	// check applies to every request.
+	noAuthCIDRsEnv = "NO_AUTH_CIDRS"
 )
 
 var httpProxyTransport = &http.Transport{
@@ -240,6 +249,11 @@ func run() error {
 		return fmt.Errorf("invalid %s: %w", connectPortsEnv, err)
 	}
 
+	noAuthNets, err := configuredNoAuthNets()
+	if err != nil {
+		return fmt.Errorf("invalid %s: %w", noAuthCIDRsEnv, err)
+	}
+
 	var tlsConfig *tls.Config
 
 	if len(acmeDomains) == 0 {
@@ -269,7 +283,15 @@ func run() error {
 		)
 	}
 
-	handler := newProxyHandler(allowedPorts, allowedAuthHashes())
+	handler := newProxyHandler(allowedPorts, allowedAuthHashes(), noAuthNets)
+
+	if len(noAuthNets) > 0 {
+		nets := make([]string, 0, len(noAuthNets))
+		for _, n := range noAuthNets {
+			nets = append(nets, n.String())
+		}
+		slog.Info("proxy authentication bypass enabled for client networks", "cidrs", nets)
+	}
 
 	server := &http.Server{
 		Addr:              listenAddr,
@@ -568,9 +590,12 @@ func listenerHostPort(host, addr string) string {
 // pre-parsed list of sha256(user:password) hex digests that authorise
 // inbound requests; it is captured once at handler construction so
 // per-request authentication does not re-read or re-parse the env.
-func newProxyHandler(allowedPorts map[string]struct{}, allowedHashes []string) http.Handler {
+// noAuthNets is an optional list of client IP networks whose requests
+// bypass the Proxy-Authorization check entirely (e.g. trusted internal
+// subnets).
+func newProxyHandler(allowedPorts map[string]struct{}, allowedHashes []string, noAuthNets []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, allowedHashes) {
+		if !clientIPExempt(r, noAuthNets) && !authorized(r, allowedHashes) {
 			w.Header().Set("Proxy-Authenticate", `Basic realm="go-https-proxy"`)
 			http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 			return
@@ -648,6 +673,79 @@ func allowedAuthHashes() []string {
 		hashes = append(hashes, p)
 	}
 	return hashes
+}
+
+// configuredNoAuthNets returns the list of IP networks whose clients are
+// exempt from proxy authentication, parsed from noAuthCIDRsEnv. Each
+// comma-separated entry may be a CIDR ("10.0.0.0/8", "2001:db8::/32")
+// or a bare IP literal, which is treated as a single-host /32 or /128.
+// Empty entries and surrounding whitespace are ignored. An invalid entry
+// is reported as an error.
+func configuredNoAuthNets() ([]*net.IPNet, error) {
+	raw := strings.TrimSpace(os.Getenv(noAuthCIDRsEnv))
+	if raw == "" {
+		return nil, nil
+	}
+
+	var nets []*net.IPNet
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Accept bracketed IPv6 literals (e.g. "[2001:db8::1]") for
+		// consistency with ACME_DOMAIN parsing elsewhere.
+		if strings.HasPrefix(p, "[") && strings.HasSuffix(p, "]") {
+			p = p[1 : len(p)-1]
+		}
+		if strings.Contains(p, "/") {
+			_, n, err := net.ParseCIDR(p)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", p, err)
+			}
+			nets = append(nets, n)
+			continue
+		}
+		ip := net.ParseIP(p)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP %q", p)
+		}
+		bits := 32
+		if ip.To4() == nil {
+			bits = 128
+		} else {
+			ip = ip.To4()
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+	return nets, nil
+}
+
+// clientIPExempt reports whether the IP encoded in r.RemoteAddr falls
+// within any of the supplied networks. A nil or empty list disables the
+// exemption.
+func clientIPExempt(r *http.Request, nets []*net.IPNet) bool {
+	if len(nets) == 0 {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	// IPv6 zone IDs (e.g. "fe80::1%eth0") must be stripped before parsing.
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func handleConnect(w http.ResponseWriter, r *http.Request, allowedPorts map[string]struct{}) {
