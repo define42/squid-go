@@ -94,7 +94,8 @@ All configuration is via environment variables.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PROXY_AUTH_SHA256` | *(none, required)* | Comma-separated `sha256(user:password)` hex digests. Empty = reject all. |
-| `LISTEN_ADDR` | `:443` | Local TCP address to bind. |
+| `LISTEN_ADDR` | `:443` | Local TCP address to bind for the TLS proxy listener. |
+| `HTTP_LISTEN_ADDR` | *(unset)* | Optional local TCP address for an additional **unencrypted** HTTP proxy listener (e.g. `:80`). When unset, only the TLS listener runs. |
 | `ACME_DOMAIN` | *(unset)* | Comma-separated DNS names / IP literals to obtain a Let's Encrypt cert for. Unset = self-signed. |
 | `ACME_EMAIL` | *(unset, required when `ACME_DOMAIN` is set)* | Contact address for Let's Encrypt account. |
 | `ACME_PROFILE` | *(auto: `shortlived` if any `ACME_DOMAIN` entry is an IP literal, else unset)* | Optional Let's Encrypt [ACME profile](https://letsencrypt.org/docs/profiles/) to request. IP-address identifiers require `shortlived` (~6-day certs); LE's default profile rejects them. |
@@ -216,6 +217,27 @@ TCP/443 reaches the process.
 # Listen on 8443 while port-forwarding external 443 → local 8443
 export LISTEN_ADDR=":8443"
 ```
+
+### Plain-HTTP (unencrypted) listener
+
+`HTTP_LISTEN_ADDR` (unset by default) optionally enables an additional
+**unencrypted** proxy listener alongside the TLS listener. When set to
+a non-empty TCP address, the same handler is served over cleartext HTTP
+in parallel with the TLS listener, so authentication, SSRF protection,
+and `CONNECT_ALLOWED_PORTS` apply identically.
+
+```sh
+# Run the standard TLS proxy on :443 and an additional plain-HTTP proxy on :80
+export LISTEN_ADDR=":443"
+export HTTP_LISTEN_ADDR=":80"
+```
+
+> **Warning.** On this listener, client `Proxy-Authorization` credentials
+> and any forwarded plain-HTTP request/response bodies travel in
+> cleartext. `CONNECT` tunnels remain end-to-end encrypted between the
+> client and the origin, but the tunnel setup (including credentials)
+> is still visible to on-path observers. Only enable this listener on
+> a trusted network segment.
 
 ## SSRF protection
 

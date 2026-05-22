@@ -538,6 +538,31 @@ func TestConfiguredListenAddr(t *testing.T) {
 	})
 }
 
+func TestConfiguredHTTPListenAddr(t *testing.T) {
+	t.Run("returns empty when env is unset", func(t *testing.T) {
+		t.Setenv(httpListenAddrEnv, "")
+		if got := configuredHTTPListenAddr(); got != "" {
+			t.Fatalf("configuredHTTPListenAddr() = %q, want %q", got, "")
+		}
+	})
+
+	t.Run("uses address from env", func(t *testing.T) {
+		want := ":80"
+		t.Setenv(httpListenAddrEnv, want)
+		if got := configuredHTTPListenAddr(); got != want {
+			t.Fatalf("configuredHTTPListenAddr() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("trims whitespace", func(t *testing.T) {
+		want := ":8080"
+		t.Setenv(httpListenAddrEnv, "  "+want+"  ")
+		if got := configuredHTTPListenAddr(); got != want {
+			t.Fatalf("configuredHTTPListenAddr() = %q, want %q", got, want)
+		}
+	})
+}
+
 func TestConfiguredACMEDomains(t *testing.T) {
 	t.Run("returns nil when env is empty", func(t *testing.T) {
 		t.Setenv(acmeDomainEnv, "")
