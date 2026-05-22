@@ -39,7 +39,7 @@ const (
 	// email used to register the ACME account with Let's Encrypt. It is
 	// required when running in ACME mode (i.e. when ACME_DOMAIN is set)
 	// so account recovery and expiration notices reach a real mailbox.
-	acmeEmailEnv  = "ACME_EMAIL"
+	acmeEmailEnv = "ACME_EMAIL"
 	// acmeDomainEnv is a comma-separated list of DNS names or IP addresses
 	// that the ACME certificate should cover (e.g.
 	// "proxy.example.com,www.proxy.example.com"). All listed names must
@@ -191,14 +191,24 @@ func resolveSafeIP(ctx context.Context, host string) (net.IP, error) {
 // extraBlockedCIDRs lists ranges that Go's net.IP helpers do not classify
 // as private/loopback/link-local but which the proxy still refuses to
 // forward to. Notably:
+//   - 0.0.0.0/8      RFC 1122 "this host on this network"; on Linux
+//     0.0.0.0 (and frequently the rest of the block) is routed to the
+//     local host, a well-known SSRF bypass for loopback services.
 //   - 100.64.0.0/10  RFC 6598 carrier-grade NAT (often used for cloud
 //     management networks and internal load balancers)
 //   - 192.0.0.0/24   RFC 6890 IETF protocol assignments
 //   - 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24  TEST-NET docs
 //   - 198.18.0.0/15  RFC 2544 benchmark
 //   - 255.255.255.255/32  limited broadcast
+//   - 64:ff9b::/96   RFC 6052 NAT64 well-known prefix. The low 32 bits
+//     embed an arbitrary IPv4 address, so on a NAT64-enabled network an
+//     attacker could smuggle a private IPv4 destination (e.g.
+//     64:ff9b::7f00:1 -> 127.0.0.1) past the IPv4 checks. It is a
+//     translation prefix, never a legitimate origin address, so the
+//     whole block is refused.
 var extraBlockedCIDRs = func() []*net.IPNet {
 	cidrs := []string{
+		"0.0.0.0/8",
 		"100.64.0.0/10",
 		"192.0.0.0/24",
 		"192.0.2.0/24",
@@ -206,6 +216,7 @@ var extraBlockedCIDRs = func() []*net.IPNet {
 		"198.51.100.0/24",
 		"203.0.113.0/24",
 		"255.255.255.255/32",
+		"64:ff9b::/96",
 		"2001:db8::/32",
 	}
 	out := make([]*net.IPNet, 0, len(cidrs))

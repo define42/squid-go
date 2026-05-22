@@ -22,10 +22,13 @@ to run unattended behind a network boundary you already trust.
   Constant-time comparison prevents timing oracles.
 - **SSRF-hardened dialer** — every outbound dial resolves once and refuses
   loopback, private, link-local, CGNAT, multicast, unspecified, TEST-NET,
-  RFC 2544 benchmark, broadcast, and IPv6 documentation ranges. IPv4-mapped
-  IPv6 addresses are unwrapped before classification. The resolved IP is
-  dialled directly, so DNS rebinding cannot redirect an already-validated
-  hostname onto an internal address.
+  RFC 2544 benchmark, broadcast, the RFC 1122 "this host" block
+  (`0.0.0.0/8`), and IPv6 documentation ranges. IPv4-mapped IPv6 addresses
+  are unwrapped before classification, and the NAT64 well-known prefix
+  (`64:ff9b::/96`) is blocked, so a private IPv4 destination cannot be
+  smuggled through an IPv6 literal. The resolved IP is dialled directly, so
+  DNS rebinding cannot redirect an already-validated hostname onto an
+  internal address.
 - **CONNECT port allow-list** — only ports listed in
   `CONNECT_ALLOWED_PORTS` (default `443`) may be tunneled.
 - **PAC file at `/proxy.pac`** — clients can be configured with the URL
@@ -251,14 +254,16 @@ export HTTP_LISTEN_ADDR=":80"
 Both `CONNECT` and plain-HTTP forwarding resolve the requested target
 once and refuse to dial any address in a private, loopback, link-local,
 unspecified, multicast, or carrier-grade-NAT (`100.64.0.0/10`) range.
-TEST-NET ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`),
-the RFC 2544 benchmark range (`198.18.0.0/15`), the limited broadcast
-address (`255.255.255.255`), and the IPv6 documentation prefix
-(`2001:db8::/32`) are also blocked. IPv4-mapped IPv6 addresses are
-unwrapped before classification so they cannot smuggle a private IPv4
-destination through an IPv6 literal. The resolved IP is dialled directly
-so DNS rebinding cannot redirect an already-validated hostname onto an
-internal address.
+The RFC 1122 "this host on this network" block (`0.0.0.0/8`), TEST-NET
+ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), the RFC
+2544 benchmark range (`198.18.0.0/15`), the limited broadcast address
+(`255.255.255.255`), and the IPv6 documentation prefix (`2001:db8::/32`)
+are also blocked. IPv4-mapped IPv6 addresses are unwrapped before
+classification, and the NAT64 well-known prefix (`64:ff9b::/96`) is
+refused outright, so a private IPv4 destination cannot be smuggled
+through an IPv6 literal. The resolved IP is dialled directly so DNS
+rebinding cannot redirect an already-validated hostname onto an internal
+address.
 
 ## Graceful shutdown
 

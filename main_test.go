@@ -942,20 +942,26 @@ func TestIsBlockedIP_ExtraRanges(t *testing.T) {
 		ip   string
 		want bool
 	}{
-		{"100.64.0.1", true},          // CGNAT
-		{"100.127.255.254", true},     // CGNAT upper
-		{"192.0.0.170", true},         // IETF protocol assignments
-		{"192.0.2.5", true},           // TEST-NET-1
-		{"198.18.0.1", true},          // benchmark
-		{"198.51.100.7", true},        // TEST-NET-2
-		{"203.0.113.5", true},         // TEST-NET-3
-		{"255.255.255.255", true},     // limited broadcast
-		{"2001:db8::5", true},         // IPv6 docs
-		{"::ffff:127.0.0.1", true},    // IPv4-mapped loopback
-		{"::ffff:10.0.0.1", true},     // IPv4-mapped private
+		{"0.1.2.3", true},          // RFC 1122 "this host on this network"
+		{"0.255.255.255", true},    // 0.0.0.0/8 upper
+		{"100.64.0.1", true},       // CGNAT
+		{"100.127.255.254", true},  // CGNAT upper
+		{"192.0.0.170", true},      // IETF protocol assignments
+		{"192.0.2.5", true},        // TEST-NET-1
+		{"198.18.0.1", true},       // benchmark
+		{"198.51.100.7", true},     // TEST-NET-2
+		{"203.0.113.5", true},      // TEST-NET-3
+		{"255.255.255.255", true},  // limited broadcast
+		{"2001:db8::5", true},      // IPv6 docs
+		{"::ffff:127.0.0.1", true}, // IPv4-mapped loopback
+		{"::ffff:10.0.0.1", true},  // IPv4-mapped private
 		{"::ffff:169.254.169.254", true},
-		{"100.63.255.254", false}, // just below CGNAT
-		{"100.128.0.1", false},    // just above CGNAT
+		{"64:ff9b::7f00:1", true},  // NAT64 embedding 127.0.0.1
+		{"64:ff9b::808:808", true}, // NAT64 embedding 8.8.8.8 (translation prefix)
+		{"100.63.255.254", false},  // just below CGNAT
+		{"100.128.0.1", false},     // just above CGNAT
+		{"1.0.0.1", false},         // just above 0.0.0.0/8
+		{"64:ff9c::1", false},      // just outside NAT64 well-known prefix
 	}
 	for _, tc := range tests {
 		t.Run(tc.ip, func(t *testing.T) {
@@ -1227,61 +1233,61 @@ func TestListenerHostPort(t *testing.T) {
 // header values, since the fuzzer cannot guess the correct sha256 digest
 // of a valid credential pair.
 func FuzzAuthorized(f *testing.F) {
-// Seed with a mix of malformed, empty, and structurally-valid headers
-// so the fuzzer has something interesting to mutate from.
-seeds := []string{
-"",
-"Basic ",
-"Basic !!!not-base64!!!",
-"Bearer " + base64.StdEncoding.EncodeToString([]byte("user:pass")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte("")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte(":")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte("user:")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte(":pass")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass:extra")),
-"Basic " + base64.StdEncoding.EncodeToString([]byte("\x00\x01\x02:\xff\xfe")),
-"Basic " + strings.Repeat("A", 1024),
-}
-for _, s := range seeds {
-f.Add(s)
-}
+	// Seed with a mix of malformed, empty, and structurally-valid headers
+	// so the fuzzer has something interesting to mutate from.
+	seeds := []string{
+		"",
+		"Basic ",
+		"Basic !!!not-base64!!!",
+		"Bearer " + base64.StdEncoding.EncodeToString([]byte("user:pass")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte("")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte(":")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte("user:")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte(":pass")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte("alice:s3cret")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass:extra")),
+		"Basic " + base64.StdEncoding.EncodeToString([]byte("\x00\x01\x02:\xff\xfe")),
+		"Basic " + strings.Repeat("A", 1024),
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
 
-// Configure an allow-list with two known-good digests. Any random
-// header that fails to decode to exactly one of these must be rejected.
-hashWant1 := sha256Hex(testProxyUser, testProxyPass)
-hashWant2 := sha256Hex(testProxyUser2, testProxyPass2)
-f.Setenv(proxyAuthEnv, hashWant1+proxyAuthDelimiter+hashWant2)
+	// Configure an allow-list with two known-good digests. Any random
+	// header that fails to decode to exactly one of these must be rejected.
+	hashWant1 := sha256Hex(testProxyUser, testProxyPass)
+	hashWant2 := sha256Hex(testProxyUser2, testProxyPass2)
+	f.Setenv(proxyAuthEnv, hashWant1+proxyAuthDelimiter+hashWant2)
 
-f.Fuzz(func(t *testing.T, header string) {
-req := httptest.NewRequest(http.MethodGet, "http://example.invalid/", nil)
-if header != "" {
-req.Header.Set("Proxy-Authorization", header)
-}
+	f.Fuzz(func(t *testing.T, header string) {
+		req := httptest.NewRequest(http.MethodGet, "http://example.invalid/", nil)
+		if header != "" {
+			req.Header.Set("Proxy-Authorization", header)
+		}
 
-// Must not panic regardless of input.
-got := authorized(req, allowedAuthHashes())
-if !got {
-return
-}
+		// Must not panic regardless of input.
+		got := authorized(req, allowedAuthHashes())
+		if !got {
+			return
+		}
 
-// If authorized returned true, the fuzzer must have stumbled onto
-// a credential pair whose sha256 matches an allow-list entry.
-// That's only possible when the header decodes to one of the
-// two seed credentials. Confirm by recomputing the digest.
-const prefix = "Basic "
-if !strings.HasPrefix(header, prefix) {
-t.Fatalf("authorized returned true for header without %q prefix: %q", prefix, header)
-}
-raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(header, prefix))
-if err != nil {
-t.Fatalf("authorized returned true for header with invalid base64: %q", header)
-}
-sum := sha256.Sum256(raw)
-gotHash := hex.EncodeToString(sum[:])
-if gotHash != hashWant1 && gotHash != hashWant2 {
-t.Fatalf("authorized returned true for header whose digest %q is not in the allow-list", gotHash)
-}
-})
+		// If authorized returned true, the fuzzer must have stumbled onto
+		// a credential pair whose sha256 matches an allow-list entry.
+		// That's only possible when the header decodes to one of the
+		// two seed credentials. Confirm by recomputing the digest.
+		const prefix = "Basic "
+		if !strings.HasPrefix(header, prefix) {
+			t.Fatalf("authorized returned true for header without %q prefix: %q", prefix, header)
+		}
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(header, prefix))
+		if err != nil {
+			t.Fatalf("authorized returned true for header with invalid base64: %q", header)
+		}
+		sum := sha256.Sum256(raw)
+		gotHash := hex.EncodeToString(sum[:])
+		if gotHash != hashWant1 && gotHash != hashWant2 {
+			t.Fatalf("authorized returned true for header whose digest %q is not in the allow-list", gotHash)
+		}
+	})
 }
