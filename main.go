@@ -55,6 +55,15 @@ const (
 	listenAddrEnv     = "LISTEN_ADDR"
 	listenAddrDefault = ":443"
 
+	// httpListenAddrEnv optionally enables an additional plain-HTTP
+	// (unencrypted) proxy listener. When set to a non-empty TCP address
+	// (e.g. ":80"), the proxy serves the same handler over cleartext
+	// HTTP in parallel with the TLS listener. When unset or empty, only
+	// the TLS listener runs. There is no default: the plain-HTTP
+	// listener is opt-in because it exposes proxy credentials and
+	// forwarded traffic without transport encryption.
+	httpListenAddrEnv = "HTTP_LISTEN_ADDR"
+
 	// certStoragePathEnv overrides the directory where CertMagic stores the
 	// ACME account key and issued certificates. Defaults to certStoragePathDefault.
 	// Operators running in read-only filesystems (e.g. distroless containers)
@@ -311,6 +320,23 @@ func run() error {
 		TLSConfig:      tlsConfig,
 	}
 
+	// Optional plain-HTTP (unencrypted) proxy listener. Enabled only
+	// when HTTP_LISTEN_ADDR is set; the same handler is reused so
+	// authentication, SSRF protection, and CONNECT port allow-listing
+	// all apply identically. Note that on this listener client
+	// credentials and proxied plain-HTTP payloads travel in cleartext.
+	var httpServer *http.Server
+	if httpListenAddr := configuredHTTPListenAddr(); httpListenAddr != "" {
+		httpServer = &http.Server{
+			Addr:              httpListenAddr,
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    1 << 20, // 1 MiB
+		}
+		slog.Info("plain-HTTP proxy listening (unencrypted)", "addr", httpListenAddr)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -324,19 +350,51 @@ func run() error {
 		serverErr <- nil
 	}()
 
-	select {
-	case <-ctx.Done():
-		slog.Info("shutdown signal received; draining connections")
+	httpServerErr := make(chan error, 1)
+	if httpServer != nil {
+		go func() {
+			err := httpServer.ListenAndServe()
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				httpServerErr <- err
+				return
+			}
+			httpServerErr <- nil
+		}()
+	}
+
+	shutdownAll := func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			slog.Error("graceful shutdown failed", "err", err)
 		}
-		// Wait for the serve goroutine to finish so we don't return while
-		// it may still be writing to the server's TLS listener.
+		if httpServer != nil {
+			if err := httpServer.Shutdown(shutdownCtx); err != nil {
+				slog.Error("graceful shutdown of HTTP listener failed", "err", err)
+			}
+		}
+	}
+
+	select {
+	case <-ctx.Done():
+		slog.Info("shutdown signal received; draining connections")
+		shutdownAll()
+		// Wait for the serve goroutines to finish so we don't return
+		// while they may still be writing to their listeners.
 		<-serverErr
+		if httpServer != nil {
+			<-httpServerErr
+		}
 		return nil
 	case err := <-serverErr:
+		if httpServer != nil {
+			shutdownAll()
+			<-httpServerErr
+		}
+		return err
+	case err := <-httpServerErr:
+		shutdownAll()
+		<-serverErr
 		return err
 	}
 }
@@ -402,6 +460,14 @@ func configuredListenAddr() string {
 		return listenAddrDefault
 	}
 	return addr
+}
+
+// configuredHTTPListenAddr returns the optional TCP address for an
+// additional plain-HTTP (unencrypted) proxy listener. It reads the
+// HTTP_LISTEN_ADDR environment variable; an empty/unset value disables
+// the plain-HTTP listener.
+func configuredHTTPListenAddr() string {
+	return strings.TrimSpace(os.Getenv(httpListenAddrEnv))
 }
 
 // configuredCertStoragePath returns the absolute path where CertMagic
