@@ -18,6 +18,23 @@ services:
     read_only: true
     cap_drop:
       - ALL
+    security_opt:
+      # Block any setuid/file-capability privilege escalation inside the container.
+      - no-new-privileges:true
+    # Resource caps to contain abuse/DoS of an internet-facing proxy.
+    pids_limit: 200
+    mem_limit: 256m
+    cpus: "1.0"
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    # Bound log growth so a noisy client can't fill the host disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
 volumes:
