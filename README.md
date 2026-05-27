@@ -1,6 +1,6 @@
 # squid-go
 
-A small, opinionated **forward HTTPS proxy** written in Go.
+A small, opinionated **forward HTTPS proxy** written in Rust.
 
 `squid-go` is *not* a port of Squid. It is a minimal, single-binary alternative
 that speaks HTTP `CONNECT` for HTTPS tunneling and plain-HTTP forwarding,
@@ -52,7 +52,7 @@ printf '%s' 'alice:s3cret' | sha256sum | awk '{print $1}'
 # 2. Start the proxy (self-signed TLS, no public reachability required)
 export PROXY_AUTH_SHA256="<digest-from-step-1>"
 export LISTEN_ADDR=":8443"
-go run .
+cargo run --release
 ```
 
 Then point a client at `https://localhost:8443` as its HTTPS proxy,
@@ -324,9 +324,10 @@ non-goals matter to your environment.
 ## Building and testing
 
 ```sh
-go vet ./...
-go build ./...
-go test -race -v ./...
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo build --locked
+cargo test --locked --all-targets
 ```
 
 The same commands run in CI (see `.github/workflows/test.yml`).

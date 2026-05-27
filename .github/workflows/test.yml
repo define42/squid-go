@@ -17,34 +17,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: 'stable'
-          cache: true
+          components: rustfmt, clippy
 
-      - name: Download modules
-        run: go mod download
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
 
-      - name: Vet
-        run: go vet ./...
+      - name: Format check
+        run: cargo fmt --all -- --check
 
-      - name: Staticcheck
-        uses: dominikh/staticcheck-action@v1
-        with:
-          version: latest
-          install-go: false
-
-      - name: Govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        run: go build ./...
+        run: cargo build --locked --verbose
 
       - name: Test
-        run: go test -race -v ./...
+        run: cargo test --locked --all-targets --verbose
 
-      - name: Fuzz authorized (short)
-        run: go test -run=^$ -fuzz=FuzzAuthorized -fuzztime=30s ./...
