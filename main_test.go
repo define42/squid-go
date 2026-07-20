@@ -831,6 +831,19 @@ func TestDialFirstReachable_NoCandidates(t *testing.T) {
 	}
 }
 
+func TestDialFirstReachable_TimeoutExhausted(t *testing.T) {
+	// A zero timeout makes the deadline check fail before the first dial
+	// attempt, exercising the budget-exhaustion branch without touching
+	// the network.
+	_, err := dialFirstReachable(context.Background(), "tcp", "443", []net.IP{net.ParseIP("192.0.2.1")}, 0)
+	if err == nil {
+		t.Fatal("dialFirstReachable() = nil error, want timeout exhaustion")
+	}
+	if !strings.Contains(err.Error(), "timeout exhausted") {
+		t.Fatalf("dialFirstReachable() error = %v, want timeout exhaustion", err)
+	}
+}
+
 func TestDialFirstReachable_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
