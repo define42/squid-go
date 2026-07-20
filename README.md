@@ -217,6 +217,17 @@ Set it to `all` (case-insensitive) to disable the allow-list and permit
 export CONNECT_ALLOWED_PORTS="all"
 ```
 
+> **Note.** This allow-list applies only to `CONNECT` tunnels, not to
+> plain-HTTP forwarding (absolute-form `GET http://host:port/` requests),
+> which may reach any port on a non-blocked host. This asymmetry is by
+> design: a `CONNECT` tunnel is a raw, bidirectional TCP splice, so
+> restricting its ports stops the proxy being repurposed as a generic TCP
+> relay to arbitrary services. A forwarded plain-HTTP request is a strictly
+> weaker primitive — it can only emit a single HTTP request and read one
+> response — so it is not port-restricted. [SSRF
+> protection](#ssrf-protection) applies to both paths, so neither can reach
+> loopback, private, or other internal addresses regardless of port.
+
 ### Listen address
 
 `LISTEN_ADDR` (default `:443`) is useful when running behind a load
@@ -296,8 +307,9 @@ SHA-256-hashed Basic authentication. The following are explicit
   credentials by removing their digest from `PROXY_AUTH_SHA256`.
 - **Egress policy / URL category filtering.** The proxy accepts any
   hostname that resolves to a non-blocked IP and any `CONNECT` target on
-  an allow-listed port (see `CONNECT_ALLOWED_PORTS`). It does not
-  enforce per-user destination policy.
+  an allow-listed port (see `CONNECT_ALLOWED_PORTS`; plain-HTTP forwarding
+  is not port-restricted, by design — see [CONNECT tunnels](#connect-tunnels)).
+  It does not enforce per-user destination policy.
 - **Auditing and per-request log retention.** Requests are logged to
   stderr in structured form via `log/slog`, but no long-term audit log,
   request body capture, or tamper-evident logging is provided.
