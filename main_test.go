@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -740,24 +741,24 @@ func TestIsBlockedIP(t *testing.T) {
 	}
 }
 
-func TestResolveSafeIP_LiteralBlocked(t *testing.T) {
+func TestResolveSafeIPs_LiteralBlocked(t *testing.T) {
 	for _, host := range []string{"127.0.0.1", "169.254.169.254", "10.1.2.3", "::1", "fe80::1"} {
 		t.Run(host, func(t *testing.T) {
-			_, err := resolveSafeIP(context.Background(), host)
+			_, err := resolveSafeIPs(context.Background(), host)
 			if !errors.Is(err, errBlockedAddress) {
-				t.Fatalf("resolveSafeIP(%q) err = %v, want errBlockedAddress", host, err)
+				t.Fatalf("resolveSafeIPs(%q) err = %v, want errBlockedAddress", host, err)
 			}
 		})
 	}
 }
 
-func TestResolveSafeIP_LiteralAllowed(t *testing.T) {
-	ip, err := resolveSafeIP(context.Background(), "8.8.8.8")
+func TestResolveSafeIPs_LiteralAllowed(t *testing.T) {
+	ips, err := resolveSafeIPs(context.Background(), "8.8.8.8")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ip.String() != "8.8.8.8" {
-		t.Fatalf("got %v, want 8.8.8.8", ip)
+	if len(ips) != 1 || ips[0].String() != "8.8.8.8" {
+		t.Fatalf("got %v, want [8.8.8.8]", ips)
 	}
 }
 
@@ -773,6 +774,136 @@ func TestSafeDial_BlocksPrivateLiteral(t *testing.T) {
 	_, err = safeDial(context.Background(), "tcp", ln.Addr().String(), 2*time.Second)
 	if !errors.Is(err, errBlockedAddress) {
 		t.Fatalf("safeDial err = %v, want errBlockedAddress", err)
+	}
+}
+
+func TestDialFirstReachable_FallsBackToNextAddress(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("relies on the whole 127.0.0.0/8 block being routed to loopback")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close() //nolint:errcheck
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener addr: %v", err)
+	}
+
+	// Nothing listens on 127.0.0.2, so the first candidate fails fast
+	// with ECONNREFUSED and the dialer must fall back to 127.0.0.1.
+	candidates := []net.IP{net.ParseIP("127.0.0.2"), net.ParseIP("127.0.0.1")}
+	conn, err := dialFirstReachable(context.Background(), "tcp", port, candidates, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dialFirstReachable() = %v, want fallback success", err)
+	}
+	defer conn.Close() //nolint:errcheck
+
+	if got, want := conn.RemoteAddr().String(), ln.Addr().String(); got != want {
+		t.Fatalf("connected to %s, want %s", got, want)
+	}
+}
+
+func TestDialFirstReachable_AllAddressesFail(t *testing.T) {
+	// Grab a free port with nothing listening on it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("split listener addr: %v", err)
+	}
+	_ = ln.Close()
+
+	_, err = dialFirstReachable(context.Background(), "tcp", port, []net.IP{net.ParseIP("127.0.0.1")}, 2*time.Second)
+	if err == nil {
+		t.Fatal("dialFirstReachable() = nil error, want dial failure")
+	}
+}
+
+func TestDialFirstReachable_NoCandidates(t *testing.T) {
+	_, err := dialFirstReachable(context.Background(), "tcp", "443", nil, time.Second)
+	if err == nil {
+		t.Fatal("dialFirstReachable() = nil error, want no-candidates failure")
+	}
+}
+
+func TestDialFirstReachable_TimeoutExhausted(t *testing.T) {
+	// A zero timeout makes the deadline check fail before the first dial
+	// attempt, exercising the budget-exhaustion branch without touching
+	// the network.
+	_, err := dialFirstReachable(context.Background(), "tcp", "443", []net.IP{net.ParseIP("192.0.2.1")}, 0)
+	if err == nil {
+		t.Fatal("dialFirstReachable() = nil error, want timeout exhaustion")
+	}
+	if !strings.Contains(err.Error(), "timeout exhausted") {
+		t.Fatalf("dialFirstReachable() error = %v, want timeout exhaustion", err)
+	}
+}
+
+func TestDialFirstReachable_ContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := dialFirstReachable(ctx, "tcp", "443", []net.IP{net.ParseIP("8.8.8.8")}, time.Second)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dialFirstReachable() = %v, want context.Canceled", err)
+	}
+}
+
+func TestInterleaveByFamily(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "v6 preferred alternates families",
+			in:   []string{"2001:4860::1", "2001:4860::2", "8.8.8.8", "8.8.4.4"},
+			want: []string{"2001:4860::1", "8.8.8.8", "2001:4860::2", "8.8.4.4"},
+		},
+		{
+			name: "v4 preferred alternates families",
+			in:   []string{"8.8.8.8", "8.8.4.4", "2001:4860::1", "2001:4860::2"},
+			want: []string{"8.8.8.8", "2001:4860::1", "8.8.4.4", "2001:4860::2"},
+		},
+		{
+			name: "uneven families keeps remainder in order",
+			in:   []string{"2001:4860::1", "8.8.8.8", "8.8.4.4", "9.9.9.9"},
+			want: []string{"2001:4860::1", "8.8.8.8", "8.8.4.4", "9.9.9.9"},
+		},
+		{
+			name: "single family unchanged",
+			in:   []string{"8.8.8.8", "8.8.4.4", "9.9.9.9"},
+			want: []string{"8.8.8.8", "8.8.4.4", "9.9.9.9"},
+		},
+		{
+			name: "two addresses unchanged",
+			in:   []string{"2001:4860::1", "8.8.8.8"},
+			want: []string{"2001:4860::1", "8.8.8.8"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := make([]net.IP, 0, len(tc.in))
+			for _, s := range tc.in {
+				ip := net.ParseIP(s)
+				if ip == nil {
+					t.Fatalf("invalid test IP %q", s)
+				}
+				in = append(in, ip)
+			}
+			got := make([]string, 0, len(tc.in))
+			for _, ip := range interleaveByFamily(in) {
+				got = append(got, ip.String())
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("interleaveByFamily(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

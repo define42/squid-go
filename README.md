@@ -27,9 +27,11 @@ to run unattended behind a network boundary you already trust.
   (`0.0.0.0/8`), and IPv6 documentation ranges. IPv4-mapped IPv6 addresses
   are unwrapped before classification, and the NAT64 well-known prefix
   (`64:ff9b::/96`) is blocked, so a private IPv4 destination cannot be
-  smuggled through an IPv6 literal. The resolved IP is dialled directly, so
-  DNS rebinding cannot redirect an already-validated hostname onto an
-  internal address.
+  smuggled through an IPv6 literal. Only the validated resolved IPs are
+  dialled — tried in order, alternating address families, until one
+  connects — so a dual-stack target stays reachable when one family is
+  broken, and DNS rebinding cannot redirect an already-validated hostname
+  onto an internal address.
 - **CONNECT port allow-list** — only ports listed in
   `CONNECT_ALLOWED_PORTS` (default `443`) may be tunneled.
 - **PAC file at `/proxy.pac`** — clients can be configured with the URL
@@ -273,9 +275,12 @@ ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), the RFC
 are also blocked. IPv4-mapped IPv6 addresses are unwrapped before
 classification, and the NAT64 well-known prefix (`64:ff9b::/96`) is
 refused outright, so a private IPv4 destination cannot be smuggled
-through an IPv6 literal. The resolved IP is dialled directly so DNS
-rebinding cannot redirect an already-validated hostname onto an internal
-address.
+through an IPv6 literal. Only IPs from that single validated resolution
+are dialled: candidates are tried in order (alternating address families,
+Happy-Eyeballs style) until one connects, so a dual-stack target with a
+broken IPv6 path still works via IPv4. No re-resolution happens at
+connect time, so DNS rebinding cannot redirect an already-validated
+hostname onto an internal address.
 
 ## Graceful shutdown
 

@@ -135,7 +135,7 @@ var httpProxyTransport = &http.Transport{
 var errBlockedAddress = errors.New("target resolves to a blocked address")
 
 // safeDialContext is a net.Dialer-compatible DialContext that resolves the
-// host once, rejects any unsafe IP, and dials the exact resolved IP. This
+// host once, rejects any unsafe IP, and dials only the resolved IPs. This
 // prevents DNS-rebinding attacks where a hostname resolves to a public IP
 // at resolution time but to a private IP at connect time.
 func safeDialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -148,28 +148,111 @@ func safeDial(ctx context.Context, network, address string, timeout time.Duratio
 		return nil, err
 	}
 
-	ip, err := resolveSafeIP(ctx, host)
+	ips, err := resolveSafeIPs(ctx, host)
 	if err != nil {
 		return nil, err
 	}
 
-	dialer := &net.Dialer{
-		Timeout:   timeout,
-		KeepAlive: 30 * time.Second,
-	}
-	return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+	return dialFirstReachable(ctx, network, port, interleaveByFamily(ips), timeout)
 }
 
-// resolveSafeIP resolves host to an IP address, returning the first IP
-// that is not blocked by isBlockedIP. If every resolved address is
-// unsafe, it returns errBlockedAddress.
-func resolveSafeIP(ctx context.Context, host string) (net.IP, error) {
+// dialFirstReachable dials each candidate IP on port in order and returns
+// the first connection that succeeds. All candidates were validated by
+// resolveSafeIPs before this point and no re-resolution happens here, so
+// the DNS-rebinding protection is unaffected by the fallback. The overall
+// timeout is divided across the remaining candidates (mirroring the
+// standard library's per-address deadline split) so an early blackholed
+// address cannot consume the whole budget. If every dial fails, the first
+// error is returned — it belongs to the resolver's preferred address, which
+// matches what the standard dialer reports.
+func dialFirstReachable(ctx context.Context, network, port string, ips []net.IP, timeout time.Duration) (net.Conn, error) {
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("dial %s: no candidate addresses", network)
+	}
+	deadline := time.Now().Add(timeout)
+	var firstErr error
+	for i, ip := range ips {
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			break
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("dial %s: timeout exhausted after %d of %d addresses", network, i, len(ips))
+			}
+			break
+		}
+		attemptTimeout := remaining / time.Duration(len(ips)-i)
+		// Floor of 2s per attempt (as in net.Dialer) so many candidates
+		// don't starve each attempt, capped at the time actually left.
+		const attemptFloor = 2 * time.Second
+		if attemptTimeout < attemptFloor {
+			attemptTimeout = min(attemptFloor, remaining)
+		}
+
+		dialer := &net.Dialer{
+			Timeout:   attemptTimeout,
+			KeepAlive: 30 * time.Second,
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, firstErr
+}
+
+// interleaveByFamily reorders ips so that address families alternate,
+// starting with the family of the first entry (the resolver's preferred
+// family). Relative order within each family is preserved. This bounds the
+// damage of a broken address family: for a dual-stack target whose
+// preferred family blackholes (e.g. advertised IPv6 with no IPv6 egress),
+// the second attempt already switches family instead of exhausting every
+// address of the broken one first — a sequential cousin of RFC 8305
+// Happy Eyeballs.
+func interleaveByFamily(ips []net.IP) []net.IP {
+	if len(ips) <= 2 {
+		return ips
+	}
+	firstIsV4 := ips[0].To4() != nil
+	primary := make([]net.IP, 0, len(ips))
+	secondary := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		if (ip.To4() != nil) == firstIsV4 {
+			primary = append(primary, ip)
+		} else {
+			secondary = append(secondary, ip)
+		}
+	}
+	out := make([]net.IP, 0, len(ips))
+	for i := 0; i < len(primary) || i < len(secondary); i++ {
+		if i < len(primary) {
+			out = append(out, primary[i])
+		}
+		if i < len(secondary) {
+			out = append(out, secondary[i])
+		}
+	}
+	return out
+}
+
+// resolveSafeIPs resolves host and returns every resolved address that is
+// not blocked by isBlockedIP, preserving resolver preference order. If
+// every resolved address is unsafe, it returns errBlockedAddress.
+func resolveSafeIPs(ctx context.Context, host string) ([]net.IP, error) {
 	// If the host is already a literal IP, validate it directly.
 	if ip := net.ParseIP(host); ip != nil {
 		if isBlockedIP(ip) {
 			return nil, errBlockedAddress
 		}
-		return ip, nil
+		return []net.IP{ip}, nil
 	}
 
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
@@ -180,12 +263,16 @@ func resolveSafeIP(ctx context.Context, host string) (net.IP, error) {
 		return nil, fmt.Errorf("no addresses found for %s", host)
 	}
 
+	ips := make([]net.IP, 0, len(addrs))
 	for _, a := range addrs {
 		if !isBlockedIP(a.IP) {
-			return a.IP, nil
+			ips = append(ips, a.IP)
 		}
 	}
-	return nil, errBlockedAddress
+	if len(ips) == 0 {
+		return nil, errBlockedAddress
+	}
+	return ips, nil
 }
 
 // extraBlockedCIDRs lists ranges that Go's net.IP helpers do not classify
