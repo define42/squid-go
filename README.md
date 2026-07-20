@@ -1,4 +1,5 @@
 # squid-go
+[![codecov](https://codecov.io/gh/define42/squid-go/graph/badge.svg?token=C1HBYRR7IJ)](https://codecov.io/gh/define42/squid-go)
 
 A small, opinionated **forward HTTPS proxy** written in Go.
 
