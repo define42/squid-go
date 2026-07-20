@@ -529,24 +529,24 @@ func TestProxyCopy_NoCloseWriter(t *testing.T) {
 	}
 }
 
-// --- resolveSafeIP / safeDial small branches ---
+// --- resolveSafeIPs / safeDial small branches ---
 
-func TestResolveSafeIP_AllResolvedBlocked(t *testing.T) {
+func TestResolveSafeIPs_AllResolvedBlocked(t *testing.T) {
 	// localhost resolves via the hosts file to loopback only, so every
 	// candidate address is rejected.
-	_, err := resolveSafeIP(context.Background(), "localhost")
+	_, err := resolveSafeIPs(context.Background(), "localhost")
 	if !errors.Is(err, errBlockedAddress) {
-		t.Fatalf("resolveSafeIP(localhost) error = %v, want errBlockedAddress", err)
+		t.Fatalf("resolveSafeIPs(localhost) error = %v, want errBlockedAddress", err)
 	}
 }
 
-func TestResolveSafeIP_LookupFailure(t *testing.T) {
-	_, err := resolveSafeIP(context.Background(), "nonexistent-host.invalid.")
+func TestResolveSafeIPs_LookupFailure(t *testing.T) {
+	_, err := resolveSafeIPs(context.Background(), "nonexistent-host.invalid.")
 	if err == nil {
-		t.Fatal("resolveSafeIP() = nil error, want lookup failure")
+		t.Fatal("resolveSafeIPs() = nil error, want lookup failure")
 	}
 	if errors.Is(err, errBlockedAddress) {
-		t.Fatalf("resolveSafeIP() error = %v, want plain lookup failure", err)
+		t.Fatalf("resolveSafeIPs() error = %v, want plain lookup failure", err)
 	}
 }
 
